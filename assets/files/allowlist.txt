@@ -1,0 +1,48 @@
+# box egress allowlist  (one entry per line; '#' comments allowed)
+#
+#   .example.com   -> matches example.com AND every subdomain  (recommended)
+#   host.example.com -> matches that exact host only
+#
+# Edit this file (or run `box allow <domain>`) — running sessions reload it
+# automatically (the guest polls this file). No rebuild needed.
+
+# === Anthropic / Claude Code (required) ===
+.anthropic.com
+.claude.ai
+.claude.com
+.statsig.com
+
+# === Node / npm ===
+.npmjs.org
+.npmjs.com
+.nodejs.org
+
+# === GitHub ===
+.github.com
+.githubusercontent.com
+.ghcr.io
+
+# === Python / PyPI ===
+.pypi.org
+.pythonhosted.org
+docs.python.org
+
+# === Debian / Ubuntu apt ===
+.debian.org
+.ubuntu.com
+
+# === Docs & references ===
+# Note: a leading-dot entry like ".octopus.com" already covers the bare
+# "octopus.com", so don't list both (squid treats that as a fatal conflict).
+.terraform.io
+.hashicorp.com
+.octopus.com
+.readthedocs.io
+.readthedocs.org
+.kubernetes.io
+pkg.go.dev
+.golang.org
+.rust-lang.org
+.crates.io
+developer.mozilla.org
+.stackoverflow.com

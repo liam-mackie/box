@@ -1,0 +1,7 @@
+# Swift build products
+/.build/
+# image export scratch
+*.tar
+.DS_Store
+# generated shell completion scripts (`make completions`)
+/completions/
