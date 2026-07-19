@@ -530,7 +530,8 @@ struct Secret: AsyncParsableCommand {
         discussion: """
             box injects a secret's value into matching requests at the egress proxy \
             (scoped by host and URL path), so Claude gets its use without its value. \
-            Requires `box ca init` + tlsInspect (path-level injection needs TLS bump). \
+            The box-proxy sidecar decrypts allowlisted (non-pinned) hosts by default, \
+            so no setup is needed; a box that defines secrets gets its own sidecar. \
             Projects can declare the secrets they need in .box/secrets.json; run \
             `box secret setup` to provide values.
             """,

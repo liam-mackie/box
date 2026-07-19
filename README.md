@@ -4,10 +4,11 @@ Run Claude Code inside an Apple [Containerization](https://github.com/apple/cont
 microVM with allowlist-only internet egress.
 
 Each session is a separate Linux VM (its own kernel) on Virtualization.framework.
-All outbound traffic is forced through an Envoy proxy sidecar that only permits
-an editable hostname allowlist, and Claude runs as a non-root user that cannot
-flush the firewall or bypass the proxy. The proxy runs in a daemon-owned sidecar
-shared across boxes — start it with `box system start` (see below).
+All outbound traffic is forced through **box-proxy**, a TLS-intercepting sidecar
+that permits only an editable hostname allowlist, and Claude runs as a non-root
+user that cannot flush the firewall or bypass the proxy. The proxy runs in a
+daemon-owned sidecar shared across boxes — start it with `box system start`
+(see below).
 
 box is a Swift binary built directly on Apple's Containerization framework: it
 boots and manages the VM itself rather than shelling out to the `container` CLI.
@@ -65,13 +66,12 @@ boxes. Edit or delete it freely — box never overwrites an existing config.
 | `box trust [--show] [--allowlist-only]` / `box untrust` | Approve this project's `.box/` + devcontainer at their current content (or revoke) |
 | `box config` | Show the resolved config, where each value came from, and the project's trust status |
 | `box fs allow\|deny\|policy` | Show or hide subpaths of the broad read-only roots, live |
-| `box secret …` | Declare credentials Claude can use but never see (env-var injection; proxy-side injection is pending — see the note below) |
+| `box secret …` | Declare credentials Claude can use but never see — box-proxy injects them into matching requests (header/cookie/query, scoped by host + path) so the agent never holds the value |
 | `box net init` / `box net ip` | One-time (sudo): install `/etc/resolver/box` so `<box-id>.box` resolves on the Mac / print a box's guest IP |
 | `box system start\|stop\|status` | Manage the daemon that owns the shared egress sidecar (required for `box run`) |
 | `box doctor [--online]` | Diagnose the host setup and box readiness |
 | `box completions [shell] [--install]` | Print (or install) shell completions for bash, zsh, or fish |
 | `box version` / `box --version` | Show box, claude-code, containerization, vminit versions |
-| `box ca init` | Generate the opt-in MITM CA — dormant until TLS inspection is wired to the Envoy proxy (see the note below) |
 
 Claude Code is baked into the image at build time, so without intervention a box
 would keep running whatever version the last build captured (the guest can't
@@ -100,25 +100,40 @@ A leading dot (`.example.com`) matches the domain and all subdomains; a bare
 
 ### How live reload works
 
-The Envoy sidecar is self-managing: its entrypoint polls the host-mounted
-allowlists (every 2s, by checksum) and regenerates + reloads Envoy when they
-change. So `box allow` just edits `~/.box/config/allowlist.txt` and every
-attached box picks it up live. (Polling, not inotify — inotify doesn't cross
-virtiofs, and Envoy's file-watch xDS even aborts when inotify is unavailable.)
+box-proxy is self-managing: it re-reads the host-mounted allowlists (every 2s, by
+mtime/size) and applies changes in place. So `box allow` just edits
+`~/.box/config/allowlist.txt` and every attached box picks it up live. (Polling,
+not inotify — inotify doesn't cross virtiofs.)
 
 ## The box daemon (egress proxy)
 
-box runs **all** egress through an [Envoy](https://www.envoyproxy.io/) forward
-proxy — there is no in-VM proxy and no co-located single-VM mode. Every `box
-run` is an agent VM whose egress is iptables-locked to an Envoy sidecar. By
-default that sidecar is **shared**: one long-lived `box daemon` process owns a
-single Envoy sidecar VM that every box uses.
+box runs **all** egress through **box-proxy**, a TLS-intercepting forward proxy
+(built on [hudsucker](https://github.com/omjadas/hudsucker)) — there is no in-VM
+proxy and no co-located single-VM mode. Every `box run` is an agent VM whose
+egress is iptables-locked to a box-proxy sidecar. By default that sidecar is
+**shared**: one long-lived `box daemon` process owns a single sidecar VM that
+every box uses.
+
+For each request box-proxy does one of three things, from the allowlist that
+applies to that box:
+
+- **deny** — the host isn't allowed → a 403, before any upstream connection.
+- **pass-through** — the host is allowed *and pinned* (the Anthropic/Claude API,
+  npm, GitHub) → the TLS connection is tunneled untouched, so cert-pinned
+  lifelines are never intercepted.
+- **bump** — the host is allowed and not pinned → box-proxy decrypts it (with an
+  auto-generated CA the guest trusts), injects any scoped `box secret`, logs the
+  full URL, and re-encrypts upstream.
+
+TLS interception is **on by default** — that's what lets `box secret` injection
+work with no setup, and it verifies the real SNI/Host rather than trusting the
+CONNECT authority.
 
 **The daemon is a required service** (like `container system start`) — start it
 explicitly:
 
 ```sh
-box system start     # boot the daemon + shared Envoy sidecar
+box system start     # boot the daemon + shared box-proxy sidecar
 box system status    # show the sidecar and attached boxes
 box system stop       # tear it down (refused while boxes are attached; --force overrides)
 ```
@@ -131,31 +146,28 @@ box system stop       # tear it down (refused while boxes are attached; --force 
   directly — Apple's vmnet lets guests on one network reach each other, so
   there's no host relay. Each box's egress firewall permits only the sidecar,
   so boxes can't reach each other.
-- **Per-box egress is isolated on the shared Envoy.** Because boxes connect
-  directly, Envoy sees each box's real source IP and enforces a *per-source*
-  allowlist via RBAC: the daemon writes each box's trusted project allowlist
-  into its own policy slot, and the sidecar's generated Envoy config grants that
-  source its domains (plus the global allowlist) — never another box's. The
-  config is regenerated and Envoy reloaded when a box attaches or detaches, and
-  global `box allow` edits reload live.
+- **Per-box egress is isolated on the shared sidecar.** Because boxes connect
+  directly, box-proxy sees each box's real source IP and enforces a *per-source*
+  allowlist: the daemon writes each box's trusted project allowlist into its own
+  policy slot, and box-proxy grants that source its domains (plus the global
+  allowlist) — never another box's. Changes reload live.
 - If the daemon dies, attached boxes keep running but lose egress until
   restarted (their network vanished with it). A crashed daemon's stale sidecar
   is reclaimed automatically on the next `box system start`.
-- **Dedicated sidecar (opt-in).** Set `dedicatedProxy` in config to give a box
-  its own Envoy sidecar VM instead of the shared one — stronger isolation, and
-  it doesn't need the daemon. Devcontainer boxes always get one (their
-  client image is the project base, so they can't be the shared sidecar).
+- **Dedicated sidecar (opt-in, or automatic).** Set `dedicatedProxy` in config to
+  give a box its own sidecar VM instead of the shared one — stronger isolation,
+  and it doesn't need the daemon. A box that **defines secrets** gets one
+  automatically (the shared sidecar can't safely hold one box's secret values),
+  as do devcontainer boxes.
 - **Every sidecar writes an egress access log** under `~/.box/logs/`:
   `shared-proxy/access.log` for the shared sidecar, `<box-id>/access.log` for
   dedicated ones. `box log --follow` tails it live; `box denied` aggregates it.
 
 > [!NOTE]
-> Current Envoy egress limits (tracked follow-ups): the allowlist is matched on
-> the CONNECT authority, not yet the verified inner TLS SNI (so domain-fronting
-> isn't closed the way the old squid peek-splice did); proxy-side `box secret`
-> header/query injection (which needs MITM) isn't wired to Envoy — env-var
-> secret injection is unaffected, and `box ca init`/`tlsInspect`/`bumpHosts`
-> stay dormant until it is; and the sidecar access logs are never rotated.
+> box-proxy is compiled from an embedded Rust crate (`proxy/`) as part of `box
+> build`. Injected secret values never appear in the access log (only the
+> pre-injection URL), and the CA signing key never leaves the sidecar. The access
+> logs are not yet rotated.
 
 ## Devcontainers and toolchains
 
@@ -210,7 +222,7 @@ defaults. `box config` prints the resolved values.
 | `skipPermissions` | `true` | Launch claude with `--dangerously-skip-permissions`. The microVM + egress allowlist is box's permission boundary, so per-tool prompts inside it add friction without isolation. Your own permission flags always win; `box login` is unaffected. |
 | `disableTelemetry` | `true` | Set `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` in the guest (Statsig, Sentry, version-check fetches). The in-guest auto-updater is disabled regardless — box manages the version. |
 | `clipboardSync` | `true` | Mirror the host clipboard's IMAGE content into the box while it runs, so pasting an image into Claude works (a guest `xclip` shim serves it). Images only — clipboard text is never synced. |
-| `dedicatedProxy` | `false` | Give this box its OWN Envoy egress sidecar VM instead of sharing the daemon-owned one — stronger isolation, higher cost, and it doesn't need `box system start`. Default false: boxes share one sidecar (see [The box daemon](#the-box-daemon-egress-proxy)). |
+| `dedicatedProxy` | `false` | Give this box its OWN box-proxy egress sidecar VM instead of sharing the daemon-owned one — stronger isolation, higher cost, and it doesn't need `box system start`. Default false: boxes share one sidecar (see [The box daemon](#the-box-daemon-egress-proxy)). A box that defines secrets gets a dedicated sidecar automatically. |
 | `extraMounts` | `[]` | Extra host dirs to expose (`source` supports `~`; `readOnly` optional). |
 | `readOnlyRoots` | `[]` | Host dirs exposed read-only under `/mnt/<basename>`; carve visibility live with `box fs allow`/`deny`. |
 | `env` / `envFile` | `{}` / — | Env vars (or a dotenv file; `env` wins) injected into the agent process at launch. |
@@ -241,7 +253,7 @@ Sources/BoxKit/        library (logic; importable by tests)
   ImageBridge.swift    container build → OCI → ImageStore.load (docker fallback);
                        launch-time claude-code version sync
   ManagedSettings.swift guest-only managed-settings.json (disables host hooks/statusline)
-  Daemon.swift         `box system`: owns the shared Envoy sidecar + vmnet network,
+  Daemon.swift         `box system`: owns the shared box-proxy sidecar + vmnet network,
                        leases addresses to boxes over a unix socket (required service)
   DaemonClient.swift   client side of the daemon protocol (lease/release/status/stop/start)
   SharedVmnet.swift    cross-process vmnet network sharing (create/serialize/rehydrate)
@@ -250,10 +262,10 @@ Sources/BoxKit/        library (logic; importable by tests)
   Toolchains.swift     curated toolchain registry (dotnet/go/rust) + project-marker detection
   Trust.swift          content-hash approval for project .box/ + devcontainer (fail-closed)
   FsPolicy.swift       dynamic read-only-root visibility rules (`box fs`)
-  EgressLog.swift      pure egress access-log parser (squid + Envoy lines) for `box log`/`denied`
+  EgressLog.swift      pure egress access-log parser for `box log`/`denied`
   Diagnostics.swift    `box doctor` checks (pure probes over injectable seams)
   SecretStore.swift    secret requirements + value bindings (global/project registry)
-  SecretInjection.swift secret validation/scoping + proxy-injection rendering (dormant on Envoy)
+  SecretInjection.swift secret validation/scoping + box-proxy secrets.json rendering
   ClipboardSync.swift  host clipboard image → per-run mount (paste-in-box)
   BoxExec.swift        exec-into-running-box control socket (server + client)
   Config.swift         layered config (global ⊕ project) + starter-config seeding
@@ -264,11 +276,12 @@ Sources/BoxKit/        library (logic; importable by tests)
   VersionStamp.swift   generated git-describe stamp — `make version-stamp`
   EmbeddedAssets.swift generated (base64 of assets/files/*) — `make gen-assets`
 Tests/BoxKitTests/     Swift Testing suites over the pure cores above
+proxy/                 box-proxy: the Rust/hudsucker MITM egress sidecar (embedded
+                       into the image + compiled by the Dockerfile's build stage)
 assets/files/
-  Dockerfile           Node + native Claude Code + Envoy + iptables; non-root agent (uid 501)
+  Dockerfile           Rust build stage → Node + native Claude Code + box-proxy + iptables
   xclip-shim.sh        guest clipboard shim serving the host-synced image
-  box-envoy-config.py  renders the per-source-allowlist Envoy config (proxy role)
-  entrypoint.sh        role-aware: proxy (runs Envoy) | client (agent, egress locked to the sidecar)
+  entrypoint.sh        role-aware: proxy (runs box-proxy) | client (agent, egress locked to the sidecar)
   allowlist.txt        default egress allowlist (seeded on first run)
   box-layers.dockerfile the devcontainer CLIENT layers (claude + agent user; no proxy)
 ```
@@ -321,11 +334,14 @@ Mapping to the framework (replacing the old `container run` flags):
   no_new_privileges (strictly weaker than the entrypoint), so an attached
   shell can't touch iptables or widen the boundary.
 - Egress: in the agent VM iptables defaults to DROP with the only allowed route
-  being the Envoy sidecar's address, so the agent has no direct route out and
+  being the box-proxy sidecar's address, so the agent has no direct route out and
   must use the proxy, which enforces the hostname allowlist. Claude runs as a
   non-root user with no `NET_ADMIN`.
-- Envoy filters by hostname **without TLS interception**, so a broad entry like
-  `.github.com` is a potential exfiltration path; keep the allowlist tight.
-  (It currently matches the CONNECT authority, not the verified inner SNI —
-  see the note under [The box daemon](#the-box-daemon-egress-proxy).)
+- box-proxy **decrypts allowlisted (non-pinned) hosts by default**, enforcing on
+  the verified TLS SNI / Host rather than the CONNECT authority — so a spoofed
+  CONNECT can't domain-front past a broad entry like `.github.com`. Pinned hosts
+  (Anthropic/Claude API, npm, GitHub) are tunneled without interception, so a
+  broad allowlist entry there is still a potential exfil path — keep it tight.
+  The forging CA's signing key stays in the sidecar; the agent VM only trusts the
+  public cert.
 - DNS (port 53) egress is allowed for resolution; DNS-tunnel exfil is out of scope.

@@ -175,7 +175,7 @@ enum Runner {
             let address = "\(iface.ipv4Address.address):3128"
             proxyAddress = address
             clientEnv = ["BOX_ROLE=client", "BOX_PROXY_ADDR=\(address)"]
-            log("box: dedicated egress sidecar (envoy) up at \(address)")
+            log("box: dedicated egress sidecar (box-proxy) up at \(address)")
         }
         if let lease = sharedLease {
             // Daemon-owned sidecar: same client shape as split mode, but the

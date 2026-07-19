@@ -1075,8 +1075,8 @@ public enum Commands {
         print("  inject:  \(location.rawValue) \(resolvedField) = \(resolvedTemplate)")
         print("  scopes:  " + scopes.map { scopeLabel($0) }.joined(separator: ", "))
         print("  source:  \(source.label)")
-        print("Needs `box ca init` so squid can inject on these hosts (auto-bumped); the")
-        print("host(s) must also be allowlisted (`box allow`) or the request is denied first.")
+        print("The host(s) must be allowlisted (`box allow`) or the request is denied first;")
+        print("the box-proxy sidecar decrypts them and injects the value (never seen by Claude).")
         if location == .query {
             print(
                 "WARNING: --as query puts the value in the URL, which can appear in proxy/upstream "
