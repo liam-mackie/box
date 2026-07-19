@@ -22,12 +22,23 @@ OUT="Sources/BoxKit/EmbeddedAssets.swift"
         b64="$(base64 < "assets/files/$1" | tr -d '\n')"
         echo "        \"$2\": \"$b64\","
     }
+    # Same, but reading from an arbitrary repo-relative source path.
+    emit_from() { # <repo-rel-src> <box-rel-path>
+        local b64
+        b64="$(base64 < "$1" | tr -d '\n')"
+        echo "        \"$2\": \"$b64\","
+    }
     emit Dockerfile     "Dockerfile"
-    emit squid.conf     "squid.conf"
-    emit deny.html      "deny.html"
     emit entrypoint.sh  "entrypoint.sh"
     emit xclip-shim.sh  "xclip-shim.sh"
+    emit box-layers.dockerfile "box-layers.dockerfile"
     emit allowlist.txt  "config/allowlist.txt"
+    # box-proxy crate source: the image build stage compiles it into the sidecar.
+    emit_from proxy/Cargo.toml "proxy/Cargo.toml"
+    emit_from proxy/Cargo.lock "proxy/Cargo.lock"
+    for f in proxy/src/*.rs; do
+        emit_from "$f" "proxy/src/$(basename "$f")"
+    done
     echo "    ]"
     echo "}"
 } > "$OUT"

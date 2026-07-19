@@ -16,8 +16,9 @@ struct AssetsTests {
             let fm = FileManager.default
 
             for rel in [
-                "Dockerfile", "squid.conf", "deny.html", "entrypoint.sh",
-                "xclip-shim.sh", "config/allowlist.txt",
+                "Dockerfile", "entrypoint.sh", "xclip-shim.sh", "config/allowlist.txt",
+                "proxy/Cargo.toml", "proxy/Cargo.lock", "proxy/src/main.rs",
+                "proxy/src/proxy.rs",
             ] {
                 #expect(
                     fm.fileExists(atPath: dir.appendingPathComponent(rel).path),
@@ -36,6 +37,19 @@ struct AssetsTests {
                 atPath: dir.appendingPathComponent("entrypoint.sh").path)
             let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
             #expect(perms & 0o111 != 0, "entrypoint.sh should be executable")
+        }
+    }
+
+    @Test("embeds the box-proxy crate source for the image build stage")
+    func materializesProxyCrate() throws {
+        try withTempBoxDir { dir in
+            try Assets.materialize()
+            let cargo = try String(
+                contentsOf: dir.appendingPathComponent("proxy/Cargo.toml"), encoding: .utf8)
+            #expect(cargo.contains("box-proxy"))
+            let main = try String(
+                contentsOf: dir.appendingPathComponent("proxy/src/main.rs"), encoding: .utf8)
+            #expect(!main.isEmpty)
         }
     }
 
@@ -64,7 +78,7 @@ struct AssetsTests {
 
             let restored = try String(contentsOf: entry, encoding: .utf8)
             #expect(restored != "tampered")
-            #expect(restored.contains("squid"))
+            #expect(restored.contains("BOX_ROLE"))
         }
     }
 }

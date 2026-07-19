@@ -123,6 +123,100 @@ struct ToolchainDockerfileTests {
     }
 }
 
+@Suite("Toolchains.detected (project markers)")
+struct ToolchainDetectTests {
+    @Test("go.mod detects go")
+    func goMod() {
+        #expect(Toolchains.detected(fromFilenames: ["go.mod", "main.go"]) == ["go"])
+    }
+
+    @Test("Cargo.toml detects rust")
+    func cargoToml() {
+        #expect(Toolchains.detected(fromFilenames: ["Cargo.toml", "src"]) == ["rust"])
+    }
+
+    @Test("csproj / fsproj / global.json detect dotnet")
+    func dotnetMarkers() {
+        #expect(Toolchains.detected(fromFilenames: ["App.csproj"]) == ["dotnet"])
+        #expect(Toolchains.detected(fromFilenames: ["App.fsproj"]) == ["dotnet"])
+        #expect(Toolchains.detected(fromFilenames: ["global.json"]) == ["dotnet"])
+    }
+
+    @Test("marker matching is case-insensitive")
+    func caseInsensitive() {
+        #expect(Toolchains.detected(fromFilenames: ["GO.MOD"]) == ["go"])
+        #expect(Toolchains.detected(fromFilenames: ["cargo.TOML"]) == ["rust"])
+        #expect(Toolchains.detected(fromFilenames: ["App.CsProj"]) == ["dotnet"])
+        #expect(Toolchains.detected(fromFilenames: ["Global.JSON"]) == ["dotnet"])
+    }
+
+    @Test("multiple markers yield a sorted, deduped union")
+    func multipleMarkers() {
+        let ids = Toolchains.detected(fromFilenames: [
+            "Cargo.toml", "go.mod", "App.csproj", "Other.fsproj",
+        ])
+        #expect(ids == ["dotnet", "go", "rust"])
+    }
+
+    @Test("no markers yield an empty set")
+    func noMarkers() {
+        #expect(Toolchains.detected(fromFilenames: ["README.md", "src", "package.json"]) == [])
+        #expect(Toolchains.detected(fromFilenames: []) == [])
+    }
+
+    @Test("only exact filenames match, not substrings")
+    func exactNames() {
+        #expect(Toolchains.detected(fromFilenames: ["not-go.mod.bak", "cargo.toml.orig"]) == [])
+    }
+}
+
+@Suite("Toolchains.effective (config vs detection)")
+struct ToolchainEffectiveTests {
+    @Test("default origin uses detection")
+    func defaultUsesDetection() {
+        #expect(
+            Toolchains.effective(configured: [], origin: .default, detected: ["go"]) == ["go"])
+    }
+
+    @Test("an explicit configured list wins over detection")
+    func explicitWins() {
+        #expect(
+            Toolchains.effective(configured: ["rust"], origin: .global, detected: ["go"])
+                == ["rust"])
+        #expect(
+            Toolchains.effective(configured: ["rust"], origin: .project, detected: ["go"])
+                == ["rust"])
+    }
+
+    @Test("an explicit empty list opts out of detection")
+    func explicitEmptyOptsOut() {
+        #expect(Toolchains.effective(configured: [], origin: .global, detected: ["go"]) == [])
+        #expect(Toolchains.effective(configured: [], origin: .project, detected: ["go"]) == [])
+    }
+
+    @Test("project-set [] over a global list disables detection (via merge)")
+    func projectEmptyOverGlobalList() {
+        let m = Config.merged(
+            global: ConfigLayer(toolchains: ["go"]), project: ConfigLayer(toolchains: []))
+        #expect(m.config.toolchains == [])
+        #expect(m.origins.toolchains == .project)
+        #expect(
+            Toolchains.effective(
+                configured: m.config.toolchains, origin: m.origins.toolchains,
+                detected: ["rust"]) == [])
+    }
+
+    @Test("absent in both layers is default origin, so detection applies (via merge)")
+    func absentIsDefault() {
+        let m = Config.merged(global: ConfigLayer(), project: ConfigLayer())
+        #expect(m.origins.toolchains == .default)
+        #expect(
+            Toolchains.effective(
+                configured: m.config.toolchains, origin: m.origins.toolchains,
+                detected: ["dotnet"]) == ["dotnet"])
+    }
+}
+
 @Suite("Toolchains.cacheDirs")
 struct ToolchainCacheDirTests {
     @Test("per-toolchain persistent cache dirs under the agent home")

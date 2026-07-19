@@ -1,13 +1,26 @@
 import Containerization
+import Darwin
 import Foundation
 
 /// Public command facade the executable target drives. Keeps argument parsing
 /// (in the `box` target) separate from behavior (here, in the kit).
 public enum Commands {
-    public static func run(extraArgs: [String]) async throws -> Int32 {
-        try await Runner.runBox(
+    public static func run(
+        extraArgs: [String], allowLocal: [String] = [], devcontainer: Bool = false
+    ) async throws -> Int32 {
+        seedStarterConfig()
+        return try await Runner.runBox(
             command: ["claude"] + extraArgs, interactive: true,
-            claudeRun: true)
+            claudeRun: true, allowLocal: allowLocal, devcontainer: devcontainer)
+    }
+
+    private static func seedStarterConfig() {
+        guard (try? Config.writeStarter()) == true else { return }
+        FileHandle.standardError.write(
+            Data(
+                ("box: wrote starter config \(Config.fileURL.path) "
+                    + "(mountClaudeConfig: ro — your ~/.claude settings apply read-only in boxes)\n")
+                    .utf8))
     }
 
     /// Open a shell. If a box is already running for this directory, attach a
@@ -15,6 +28,7 @@ public enum Commands {
     /// background commands/servers next to the live Claude session; `--new`
     /// forces a separate VM.
     public static func shell(extraArgs: [String], new: Bool = false) async throws -> Int32 {
+        seedStarterConfig()
         if !new {
             let cwd = FileManager.default.currentDirectoryPath
             if let match = RunState.list().first(where: { $0.cwd == cwd }),
@@ -61,7 +75,8 @@ public enum Commands {
     }
 
     public static func login() async throws -> Int32 {
-        try await Runner.runBox(command: ["claude", "/login"], interactive: true)
+        seedStarterConfig()
+        return try await Runner.runBox(command: ["claude", "/login"], interactive: true)
     }
 
     public static func build(noCache: Bool) async throws {
@@ -165,9 +180,8 @@ public enum Commands {
     }
 
     /// Interactive (and headless) promotion of recently-denied hosts into the
-    /// allowlist. Reuses `denied()` for host extraction, `DeniedHost.normalize`
-    /// to map raw log tokens to candidate entries, and `Allowlist.conflicts` to
-    /// skip a dotted+bare collision that would wedge squid.
+    /// allowlist. Reuses `denied()` for host extraction and `DeniedHost.normalize`
+    /// to map raw log tokens to candidate entries.
     public static func promoteDenied(all: Bool = false, yes: Bool = false) throws {
         // Deduplicate + normalize the raw denied hosts, preserving sorted order
         // (denied() already returns them sorted and uniqued by raw token).
@@ -184,14 +198,11 @@ public enum Commands {
         }
 
         try Assets.materialize()
-        let existing =
-            (try? String(contentsOf: Box.allowlist, encoding: .utf8))?
-            .components(separatedBy: "\n") ?? []
 
         // Headless escape: --all (+ optional --yes) promotes everything as a
         // wildcard, no prompts.
         if all || yes {
-            try addPromoted(candidates.map(\.wildcard), existing: existing)
+            try addPromoted(candidates.map(\.wildcard))
             return
         }
 
@@ -243,29 +254,15 @@ public enum Commands {
             print("nothing to add.")
             return
         }
-        try addPromoted(toAdd, existing: existing)
+        try addPromoted(toAdd)
     }
 
-    /// Filter out any entry that would create a dotted+bare squid conflict with
-    /// the resulting list, then write + reload via the shared tail.
-    private static func addPromoted(_ toAdd: [String], existing: [String]) throws {
-        var safe: [String] = []
-        for entry in toAdd {
-            if Allowlist.conflicts(in: existing + safe + [entry]).isEmpty {
-                safe.append(entry)
-            } else {
-                print("skipped \(entry): would conflict with an existing entry for the same host.")
-            }
-        }
-        guard !safe.isEmpty else {
-            print("nothing to add.")
-            return
-        }
-        try writeAllowlistAndReload(adding: safe)
+    private static func addPromoted(_ toAdd: [String]) throws {
+        try writeAllowlistAndReload(adding: toAdd)
     }
 
-    /// Hosts squid recently blocked, sorted — the plain list the promotion flow
-    /// (`box allow`, `box denied -i`) builds its menu from.
+    /// Hosts the egress proxy recently blocked, sorted — the plain list the
+    /// promotion flow (`box allow`, `box denied -i`) builds its menu from.
     public static func denied() -> [String] {
         deniedReport().map(\.host).sorted()
     }
@@ -322,6 +319,55 @@ public enum Commands {
 
     public static func listBoxes() -> [(id: String, cwd: String)] {
         RunState.list()
+    }
+
+    // MARK: - Networking (`.box` name resolution)
+
+    /// One-time host setup: install `/etc/resolver/box` so the Mac routes `*.box`
+    /// lookups to box's loopback resolver, then HUP mDNSResponder. Needs root —
+    /// run as `sudo box net init`.
+    public static func netInit() throws {
+        try BoxNet.installResolver()
+        print("box: installed \(BoxNet.resolverFile) → 127.0.0.1:\(BoxNet.resolverPort)")
+        print("     running boxes are now reachable at <box-id>.box")
+    }
+
+    /// Hidden resolver entry point (`box __resolver`): run the singleton `.box`
+    /// DNS responder in the foreground. Spawned detached by `box run`.
+    public static func runResolver() throws {
+        try BoxNet.runResolver()
+    }
+
+    /// Print a box's guest IP: the box for this directory, the only running box,
+    /// or an explicit `--box <id>`; `--all` lists every box as `IP\t<id>.box`.
+    public static func boxIP(box: String?, all: Bool) throws {
+        let states = BoxNet.all()
+        guard !states.isEmpty else { throw CBError("no running boxes with a network sidecar.") }
+        if all {
+            for s in states.sorted(by: { $0.id < $1.id }) {
+                print("\(s.state.guestIP)\t\(s.id).box")
+            }
+            return
+        }
+        let match: (id: String, state: BoxNet.NetState)?
+        if let box {
+            match = states.first { $0.id == box }
+        } else {
+            let cwd = FileManager.default.currentDirectoryPath
+            if let here = RunState.list().first(where: { $0.cwd == cwd }) {
+                match = states.first { $0.id == here.id }
+            } else if states.count == 1 {
+                match = states.first
+            } else {
+                match = nil
+            }
+        }
+        guard let m = match else {
+            throw CBError(
+                "ambiguous or no match; pick one with --box <id> (or --all):\n"
+                    + states.map { "  \($0.id)" }.joined(separator: "\n"))
+        }
+        print(m.state.guestIP)
     }
 
     // MARK: - Egress log
@@ -774,14 +820,19 @@ public enum Commands {
 
         // Record the live hashes. A nil hash means the file is absent, so there's
         // nothing to approve on that side.
-        var record = Trust.Record(allowlist: d.allowlistHash, config: nil)
+        var record = Trust.Record(
+            allowlist: d.allowlistHash, config: nil, devcontainer: nil)
         if !allowlistOnly {
             record.config = d.configHash
+            record.devcontainer = d.devcontainerHash
         }
 
-        guard record.allowlist != nil || record.config != nil else {
+        guard
+            record.allowlist != nil || record.config != nil
+                || record.devcontainer != nil
+        else {
             print(
-                "project .box/ at \(d.boxDir.path) has neither allowlist.txt nor config.json — nothing to trust."
+                "project .box/ at \(d.boxDir.path) has no allowlist.txt, config.json, or .devcontainer — nothing to trust."
             )
             return
         }
@@ -798,10 +849,25 @@ public enum Commands {
             print(
                 "  config.json    NOT trusted (--allowlist-only: extraMounts/env/readOnlyRoots stay off)"
             )
-        } else if record.config != nil {
-            print("  config.json    approved (extraMounts/env/readOnlyRoots now honored)")
+            print("  secrets.json   NOT trusted (--allowlist-only: declared secrets stay off)")
+            print(
+                "  devcontainer.json  NOT trusted (--allowlist-only: box won't auto-build on it)")
         } else {
-            print("  config.json    (absent)")
+            if record.config != nil {
+                print("  config.json    approved (extraMounts/env/readOnlyRoots now honored)")
+            } else {
+                print("  config.json    (absent)")
+            }
+            if record.secrets != nil {
+                print("  secrets.json   approved (declared secret requirements now honored)")
+            } else {
+                print("  secrets.json   (absent)")
+            }
+            if record.devcontainer != nil {
+                print("  devcontainer.json  approved (box will auto-build on this devcontainer base)")
+            } else {
+                print("  devcontainer.json  (absent)")
+            }
         }
         print("Any edit to these files re-blocks them until you run `box trust` again.")
     }
@@ -845,11 +911,17 @@ public enum Commands {
         line(
             "config.json", present: d.configHash != nil,
             approved: record?.config, trusted: decision.configTrusted)
+        line(
+            "secrets.json", present: d.secretsHash != nil,
+            approved: record?.secrets, trusted: decision.secretsTrusted)
+        line(
+            "devcontainer.json", present: d.devcontainerHash != nil,
+            approved: record?.devcontainer, trusted: decision.devcontainerTrusted)
     }
 
     // MARK: - Dynamic filesystem visibility
     //
-    // `box fs-allow`/`fs-deny` toggle the VISIBILITY of subpaths under the broad
+    // `box fs allow`/`box fs deny` toggle the VISIBILITY of subpaths under the broad
     // read-only roots by editing the host policy file `Box.fsPolicy`
     // (`~/.box/config/fs-policy.txt`). That file lives inside `Box.configDir`,
     // which the runner mounts read-only at `/etc/box`, so a host edit is visible
@@ -893,7 +965,7 @@ public enum Commands {
     public static func fsPolicy() throws {
         let rules = readFsPolicyRules()
         guard !rules.isEmpty else {
-            print("(no fs-policy rules — broad read-only roots are fully visible)")
+            print("(no rules yet — the broad read-only roots are fully visible)")
             print("policy file: \(Box.fsPolicy.path)")
             return
         }
@@ -911,38 +983,30 @@ public enum Commands {
         return FsPolicy.parse(text)
     }
 
-    // MARK: - Opt-in MITM CA
+    public struct CAFiles: Sendable {
+        public let cert: URL
+        public let key: URL
+    }
 
-    /// Generate a self-signed CA in `Box.caDir` (host side) that squid can use to
-    /// forge leaf certs for `bumpHosts` when `tlsInspect` is enabled. Writes
-    /// `ca.key` (0600) and `ca.crt`. Refuses to clobber an existing CA so a stale
-    /// one isn't silently replaced (which would invalidate already-trusted
-    /// guests). The key never leaves the host except as a read-only mount into a
-    /// box the user explicitly opted into; inside the guest it's re-staged
-    /// root:proxy 0640 so the agent (uid 501) can't read it.
-    public static func caInit() throws {
+    @discardableResult
+    public static func ensureCA() throws -> CAFiles {
         let fm = FileManager.default
         let caDir = Box.caDir
         let keyURL = caDir.appendingPathComponent("ca.key")
         let certURL = caDir.appendingPathComponent("ca.crt")
 
-        if fm.fileExists(atPath: keyURL.path) || fm.fileExists(atPath: certURL.path) {
-            throw CBError(
-                "a CA already exists in \(caDir.path) "
-                    + "(ca.key/ca.crt). Remove it to regenerate (this invalidates any "
-                    + "guest that already trusts the old CA).")
+        if fm.fileExists(atPath: keyURL.path), fm.fileExists(atPath: certURL.path) {
+            return CAFiles(cert: certURL, key: keyURL)
         }
 
         guard Sh.exists("openssl") else {
-            throw CBError("openssl not found on PATH; required to generate the CA.")
+            throw CBError("openssl not found on PATH; required to generate the box MITM CA.")
         }
 
         try fm.createDirectory(
             at: caDir, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
 
-        // Self-signed CA: 4096-bit RSA key + a 10-year CA cert. `-addext` writes
-        // the CA basic-constraint so the guest accepts it as an issuer.
         try Sh.checked([
             "openssl", "req", "-x509", "-newkey", "rsa:4096", "-nodes",
             "-keyout", keyURL.path, "-out", certURL.path,
@@ -952,26 +1016,345 @@ public enum Commands {
             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
         ])
 
-        // The CA key is sensitive: lock it to the owner.
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
         try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: certURL.path)
+        return CAFiles(cert: certURL, key: keyURL)
+    }
 
-        print("generated MITM CA:")
-        print("  \(keyURL.path)  (private key, 0600)")
-        print("  \(certURL.path)  (certificate)")
-        print("")
-        print("Enable inspection by setting in your box config:")
-        print("  \"tlsInspect\": true,")
-        print("  \"bumpHosts\": [\"example.internal\"]   // hosts to decrypt; everything")
-        print(
-            "                                          // else (Anthropic API, npm, git) stays spliced"
-        )
+    // MARK: - Proxy-injected secrets (`box secret`)
+    //
+    // A secret lets Claude *use* a credential without *seeing* it: squid (uid
+    // proxy) injects the value into matching requests; the agent only ever sees a
+    // redacted manifest. See SecretStore / SecretInjection / Runner.secretMounts.
+    // Requires the OpenSSL squid + `box ca init` (path-level injection needs bump).
+
+    /// Define a GLOBAL secret (requirement + its value binding) in one shot.
+    public static func secretSet(
+        name: String, fromEnv: String?, fromKeychain: String?,
+        location locationRaw: String, field: String?, template: String?,
+        hosts: [String], pathPrefix: String?, pathRegex: String?
+    ) throws {
+        let source = try parseSource(fromEnv: fromEnv, fromKeychain: fromKeychain)
+        guard let location = SecretLocation(rawValue: locationRaw.lowercased()) else {
+            throw CBError(
+                "--as must be one of: "
+                    + SecretLocation.allCases.map { $0.rawValue }.joined(separator: ", "))
+        }
+        let resolvedField: String
+        if let f = field, !f.trimmingCharacters(in: .whitespaces).isEmpty {
+            resolvedField = f
+        } else if location == .header {
+            resolvedField = "Authorization"
+        } else {
+            throw CBError("--name (the \(location.rawValue) field name) is required for --as \(location.rawValue)")
+        }
+        let resolvedTemplate = template ?? (location == .header ? "Bearer ${value}" : "${value}")
+
+        let cleanedHosts = hosts.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !cleanedHosts.isEmpty else { throw CBError("at least one --host is required") }
+        let scopes = cleanedHosts.map {
+            SecretScope(host: $0, pathPrefix: pathPrefix, pathRegex: pathRegex)
+        }
+
+        let req = SecretRequirement(
+            name: name,
+            injection: SecretInjectionSpec(
+                location: location, field: resolvedField, template: resolvedTemplate),
+            scopes: scopes)
+        let errs = req.validationErrors(isPinned: Runner.isAlwaysSpliced)
+        guard errs.isEmpty else {
+            throw CBError("invalid secret:\n  - " + errs.joined(separator: "\n  - "))
+        }
+
+        var registry = SecretStore.load()
+        registry.upsert(req)
+        registry.bindings[name] = source
+        try SecretStore.save(registry)
+
+        print("defined secret \"\(name)\":")
+        print("  inject:  \(location.rawValue) \(resolvedField) = \(resolvedTemplate)")
+        print("  scopes:  " + scopes.map { scopeLabel($0) }.joined(separator: ", "))
+        print("  source:  \(source.label)")
+        print("Needs `box ca init` so squid can inject on these hosts (auto-bumped); the")
+        print("host(s) must also be allowlisted (`box allow`) or the request is denied first.")
+        if location == .query {
+            print(
+                "WARNING: --as query puts the value in the URL, which can appear in proxy/upstream "
+                    + "logs. Prefer --as header/cookie unless the API only accepts a query credential.")
+        }
+    }
+
+    /// Interactive: walk every unmet requirement (project-declared, if trusted, +
+    /// any global one lacking a resolvable binding), show its requested scope, and
+    /// let the user bind an env var or paste a value (stored in the login Keychain).
+    public static func secretSetup() throws {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let discovered = ProjectTrust.discover(cwd: cwd)
+        let decision = ProjectTrust.evaluate(discovered)
+        var registry = SecretStore.load()
+
+        var projectReqs: [SecretRequirement] = []
+        if let d = discovered {
+            let file = SecretStore.loadProject(from: d.secretsURL)
+            if !file.requirements.isEmpty && !decision.secretsTrusted {
+                print("this project declares \(file.requirements.count) secret(s), but .box/secrets.json is NOT trusted.")
+                print("Review it and run `box trust`, then re-run `box secret setup`.\n")
+            }
+            if decision.secretsTrusted { projectReqs = file.requirements }
+        }
+
+        let effective = SecretInjection.effectiveRequirements(
+            global: registry.requirements, project: projectReqs)
+        let needing = effective.filter { req in
+            guard let src = registry.bindings[req.name] else { return true }
+            return Runner.resolveSecretValue(src) == nil
+        }
+        guard !needing.isEmpty else {
+            print("all declared secrets are set. (`box secret ls` to review)")
+            return
+        }
+
+        print("These secrets need a value:\n")
+        for req in needing {
+            let errs = req.validationErrors(isPinned: Runner.isAlwaysSpliced)
+            if !errs.isEmpty {
+                print("• \(req.name): SKIPPED (invalid declaration)")
+                errs.forEach { print("    - \($0)") }
+                continue
+            }
+            print("• \(req.name)")
+            print("    inject: \(req.injection.location.rawValue) \(injField(req))")
+            print("    scopes: " + req.scopes.map { scopeLabel($0) }.joined(separator: ", "))
+            print("    provide via [e]nv var, [p]aste, or [s]kip? ", terminator: "")
+            guard let choice = readLine(strippingNewline: true)?.lowercased() else { break }
+            switch choice.first {
+            case "e":
+                print("    env var name [\(req.name)]: ", terminator: "")
+                let entered = readLine(strippingNewline: true)?.trimmingCharacters(in: .whitespaces) ?? ""
+                let varName = entered.isEmpty ? req.name : entered
+                registry.bindings[req.name] = .env(varName)
+                print("    bound to $\(varName) (resolved at launch)")
+            case "p":
+                let value = String(cString: getpass("    paste value (hidden): "))
+                guard !value.isEmpty else { print("    empty; skipped"); continue }
+                let service = "box-secret-\(req.name)"
+                let account = NSUserName()
+                try Sh.checked([
+                    "security", "add-generic-password", "-U",
+                    "-s", service, "-a", account, "-w", value,
+                ])
+                registry.bindings[req.name] = .keychain(service: service, account: account)
+                print("    stored in Keychain as \(service) (registry references it; no plaintext)")
+            default:
+                print("    skipped")
+            }
+        }
+        try SecretStore.save(registry)
+        print("\nsaved. (`box secret ls` to review)")
+    }
+
+    /// List the effective secrets (global + trusted-project) with bound/unmet
+    /// status. Never prints values.
+    public static func secretList() {
+        let (effective, registry, globalNames, project) = effectiveSecrets()
+        guard !effective.isEmpty else {
+            print("no secrets defined.")
+            print("  define one:  box secret set NAME --from-env VAR --host HOST [--path-prefix /p]")
+            if !project.isEmpty {
+                print("  (this project declares secrets, but .box/secrets.json isn't trusted — `box trust`)")
+            }
+            return
+        }
+        for req in effective { printSecret(req, registry: registry, globalNames: globalNames) }
+    }
+
+    /// Show one secret's spec + status (never its value).
+    public static func secretShow(name: String) throws {
+        let (effective, registry, globalNames, _) = effectiveSecrets()
+        guard let req = effective.first(where: { $0.name == name }) else {
+            throw CBError("no secret named \"\(name)\" (see `box secret ls`).")
+        }
+        printSecret(req, registry: registry, globalNames: globalNames)
+    }
+
+    /// Remove a GLOBAL secret (requirement + binding). Project-declared
+    /// requirements live in `.box/secrets.json` and aren't removed here.
+    public static func secretRemove(name: String) throws {
+        var registry = SecretStore.load()
+        let had = registry.remove(name: name)
+        try SecretStore.save(registry)
+        if had {
+            print("removed secret \"\(name)\" from the global registry.")
+        } else {
+            print("no global secret named \"\(name)\" (project-declared secrets live in .box/secrets.json).")
+        }
+    }
+
+    // Secret helpers -----------------------------------------------------------
+
+    private static func parseSource(fromEnv: String?, fromKeychain: String?) throws -> SecretSource {
+        switch (fromEnv, fromKeychain) {
+        case let (v?, nil):
+            let name = v.trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { throw CBError("--from-env needs a variable name") }
+            return .env(name)
+        case let (nil, kc?):
+            let parts = kc.split(separator: "/", maxSplits: 1).map(String.init)
+            let service = parts[0].trimmingCharacters(in: .whitespaces)
+            let account = parts.count > 1 ? parts[1] : NSUserName()
+            guard !service.isEmpty else { throw CBError("--from-keychain needs a service name") }
+            return .keychain(service: service, account: account)
+        default:
+            throw CBError("provide exactly one of --from-env or --from-keychain")
+        }
+    }
+
+    /// Effective requirements (global + trusted-project) + supporting state for
+    /// the read-only `ls`/`show` commands.
+    private static func effectiveSecrets()
+        -> (reqs: [SecretRequirement], registry: SecretRegistry, globalNames: Set<String>,
+            projectReqs: [SecretRequirement])
+    {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let discovered = ProjectTrust.discover(cwd: cwd)
+        let decision = ProjectTrust.evaluate(discovered)
+        let registry = SecretStore.load()
+        var declared: [SecretRequirement] = []
+        var trustedProject: [SecretRequirement] = []
+        if let d = discovered {
+            declared = SecretStore.loadProject(from: d.secretsURL).requirements
+            if decision.secretsTrusted { trustedProject = declared }
+        }
+        let effective = SecretInjection.effectiveRequirements(
+            global: registry.requirements, project: trustedProject)
+        return (effective, registry, Set(registry.requirements.map { $0.name }), declared)
+    }
+
+    private static func printSecret(
+        _ req: SecretRequirement, registry: SecretRegistry, globalNames: Set<String>
+    ) {
+        let origin = globalNames.contains(req.name) ? "global" : "project"
+        let status: String
+        if let src = registry.bindings[req.name] {
+            status = Runner.resolveSecretValue(src) != nil ? src.label : "\(src.label) (UNRESOLVED)"
+        } else {
+            status = "UNMET — run `box secret setup`"
+        }
+        print("\(req.name)  [\(origin)]")
+        print("  inject: \(req.injection.location.rawValue) \(injField(req)) = \(req.injection.template)")
+        print("  scopes: " + req.scopes.map { scopeLabel($0) }.joined(separator: ", "))
+        print("  source: \(status)")
+    }
+
+    private static func injField(_ r: SecretRequirement) -> String {
+        r.injection.location == .cookie ? "Cookie" : r.injection.field
+    }
+
+    private static func scopeLabel(_ s: SecretScope) -> String {
+        var out = s.host
+        if let p = s.pathPrefix {
+            out += p + "*"
+        } else if let rx = s.pathRegex {
+            out += " ~\(rx)"
+        }
+        return out
     }
 
     /// Print the effective (layered) configuration with per-value provenance
     /// (`[global]`/`[project]`/`[default]`), both source file paths, and this
     /// project's trust status. The project layer is folded in only when its
     /// config component is trusted (otherwise it's global-only, fail-closed).
+    public static func completionShell(argument: String?, shellEnv: String?) throws
+        -> CompletionShell
+    {
+        let choices = CompletionShell.allCases.map(\.rawValue).joined(separator: ", ")
+        if let argument {
+            guard let shell = CompletionShell(rawValue: argument) else {
+                throw CBError("unknown shell '\(argument)'; expected one of: \(choices)")
+            }
+            return shell
+        }
+        if let name = shellEnv.map({ ($0 as NSString).lastPathComponent }),
+            let shell = CompletionShell(rawValue: name)
+        {
+            return shell
+        }
+        throw CBError("couldn't tell your shell from $SHELL; pass one of: \(choices)")
+    }
+
+    public static func completionInstallURL(_ shell: CompletionShell, home: URL) -> URL {
+        switch shell {
+        case .zsh: return home.appendingPathComponent(".zfunc/_box")
+        case .bash:
+            return home.appendingPathComponent(".local/share/bash-completion/completions/box")
+        case .fish: return home.appendingPathComponent(".config/fish/completions/box.fish")
+        }
+    }
+
+    static let zshFpathHint =
+        "add to ~/.zshrc:  fpath+=~/.zfunc; autoload -Uz compinit && compinit"
+
+    static func zshHint(zshrc: String?) -> String? {
+        if let zshrc, zshrc.contains(".zfunc") { return nil }
+        return zshFpathHint
+    }
+
+    public static func installCompletion(_ shell: CompletionShell, script: String) throws -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let url = completionInstallURL(shell, home: home)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(script.utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    public static func zshInstallHint() -> String? {
+        let zshrc = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".zshrc")
+        return zshHint(zshrc: try? String(contentsOf: zshrc, encoding: .utf8))
+    }
+
+    static func configReport(_ merged: MergedConfig, detectedToolchains: [String]) -> [String] {
+        let c = merged.config
+        let o = merged.origins
+        func tag(_ origin: Origin) -> String { "[\(origin.rawValue)]" }
+        func list(_ items: [String]) -> String {
+            items.isEmpty ? "(none)" : items.joined(separator: ", ")
+        }
+
+        var lines = [
+            "mountClaudeConfig:    \(c.mountClaudeConfig.rawValue) \(tag(o.mountClaudeConfig))",
+            "syncClaudeVersion:    \(c.syncClaudeVersion) \(tag(o.syncClaudeVersion))",
+            "skipPermissions:      \(c.skipPermissions) \(tag(o.skipPermissions))",
+            "disableTelemetry:     \(c.disableTelemetry) \(tag(o.disableTelemetry))",
+            "clipboardSync:        \(c.clipboardSync) \(tag(o.clipboardSync))",
+            "dedicatedProxy:       \(c.dedicatedProxy) \(tag(o.dedicatedProxy))",
+            "cpus:                 \(c.cpus) \(tag(o.cpus))",
+            "memory:               \(c.memory) \(tag(o.memory))",
+            "rootfsSize:           \(c.rootfsSize) \(tag(o.rootfsSize))",
+        ]
+        if o.toolchains == .default && !detectedToolchains.isEmpty {
+            lines.append(
+                "toolchains:           \(detectedToolchains.joined(separator: ", ")) [detected]")
+        } else {
+            lines.append("toolchains:           \(list(c.toolchains)) \(tag(o.toolchains))")
+        }
+        lines.append("readOnlyRoots:        \(list(c.readOnlyRoots)) \(tag(o.readOnlyRoots))")
+        lines.append(
+            "env:                  \(c.env.isEmpty ? "(none)" : c.env.keys.sorted().joined(separator: ", ")) \(tag(o.env))"
+        )
+        lines.append("envFile:              \(c.envFile ?? "(none)") \(tag(o.envFile))")
+        if c.extraMounts.isEmpty {
+            lines.append("extraMounts:          (none) \(tag(o.extraMounts))")
+        } else {
+            lines.append("extraMounts: \(tag(o.extraMounts))")
+            for m in c.extraMounts {
+                lines.append("  - \(m.source) -> \(m.destination)\(m.readOnly ? " (ro)" : "")")
+            }
+        }
+        return lines
+    }
+
     public static func showConfig() {
         let fm = FileManager.default
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
@@ -981,8 +1364,6 @@ public enum Commands {
         let discovered = ProjectTrust.discover(cwd: cwd)
         let decision = ProjectTrust.evaluate(discovered)
         let merged = Config.loadLayered(cwd: cwd, trustProjectConfig: decision.configTrusted)
-        let c = merged.config
-        let o = merged.origins
 
         let globalPresent = fm.fileExists(atPath: Config.fileURL.path)
         print(
@@ -996,34 +1377,10 @@ public enum Commands {
         }
         print("")
 
-        func tag(_ origin: Origin) -> String { "[\(origin.rawValue)]" }
-        print("mountClaudeConfig:    \(c.mountClaudeConfig) \(tag(o.mountClaudeConfig))")
-        print("claudeConfigReadOnly: \(c.claudeConfigReadOnly) \(tag(o.claudeConfigReadOnly))")
-        print("mountHooks:           \(c.mountHooks) \(tag(o.mountHooks))")
-        print("syncClaudeVersion:    \(c.syncClaudeVersion) \(tag(o.syncClaudeVersion))")
-        print("skipPermissions:      \(c.skipPermissions) \(tag(o.skipPermissions))")
-        print("disableTelemetry:     \(c.disableTelemetry) \(tag(o.disableTelemetry))")
-        print("clipboardSync:        \(c.clipboardSync) \(tag(o.clipboardSync))")
-        print("cpus:                 \(c.cpus) \(tag(o.cpus))")
-        print("memory:               \(c.memory) \(tag(o.memory))")
-        print("rootfsSize:           \(c.rootfsSize) \(tag(o.rootfsSize))")
-        print(
-            "toolchains:           \(c.toolchains.isEmpty ? "(none)" : c.toolchains.joined(separator: ", ")) \(tag(o.toolchains))"
-        )
-        print(
-            "readOnlyRoots:        \(c.readOnlyRoots.isEmpty ? "(none)" : c.readOnlyRoots.joined(separator: ", ")) \(tag(o.readOnlyRoots))"
-        )
-        print(
-            "env:                  \(c.env.isEmpty ? "(none)" : c.env.keys.sorted().joined(separator: ", ")) \(tag(o.env))"
-        )
-        print("envFile:              \(c.envFile ?? "(none)") \(tag(o.envFile))")
-        if c.extraMounts.isEmpty {
-            print("extraMounts:          (none) \(tag(o.extraMounts))")
-        } else {
-            print("extraMounts: \(tag(o.extraMounts))")
-            for m in c.extraMounts {
-                print("  - \(m.source) -> \(m.destination)\(m.readOnly ? " (ro)" : "")")
-            }
+        let detectedToolchains =
+            merged.origins.toolchains == .default ? Runner.detectedToolchains(cwd: cwd) : []
+        for line in configReport(merged, detectedToolchains: detectedToolchains) {
+            print(line)
         }
 
         // Project trust status, so it's clear why a project layer is or isn't in
@@ -1035,4 +1392,8 @@ public enum Commands {
             print("project .box/: (none) — global-only")
         }
     }
+}
+
+public enum CompletionShell: String, CaseIterable, Sendable {
+    case bash, zsh, fish
 }

@@ -82,6 +82,46 @@ struct TrustCoreTests {
         #expect(!Trust.isSensitiveSource("/Users/me/projects/repo", home: home))
         #expect(!Trust.isSensitiveSource("/Users/me/.config/box", home: home))
     }
+
+    @Test("devcontainer trusted only on an exact hash match, fail-closed otherwise")
+    func devcontainerEvaluate() {
+        let record = Trust.Record(
+            allowlist: "a", config: "c", secrets: "s", devcontainer: "dc")
+        let match = Trust.evaluate(
+            record: record, liveAllowlistHash: "a", liveConfigHash: "c",
+            liveSecretsHash: "s", liveDevcontainerHash: "dc")
+        #expect(match.devcontainerTrusted)
+        let mismatch = Trust.evaluate(
+            record: record, liveAllowlistHash: "a", liveConfigHash: "c",
+            liveSecretsHash: "s", liveDevcontainerHash: "edited")
+        #expect(!mismatch.devcontainerTrusted)
+        let absentLive = Trust.evaluate(
+            record: record, liveAllowlistHash: "a", liveConfigHash: "c",
+            liveSecretsHash: "s", liveDevcontainerHash: nil)
+        #expect(!absentLive.devcontainerTrusted)
+    }
+
+    @Test("--allowlist-only records devcontainer==nil → devcontainer never trusted")
+    func devcontainerAllowlistOnly() {
+        let record = Trust.Record(allowlist: "a", config: nil, secrets: nil, devcontainer: nil)
+        let d = Trust.evaluate(
+            record: record, liveAllowlistHash: "a", liveConfigHash: "c",
+            liveSecretsHash: "s", liveDevcontainerHash: "dc")
+        #expect(d.allowlistTrusted)
+        #expect(!d.devcontainerTrusted)
+    }
+
+    @Test("legacy record JSON without a devcontainer key decodes nil (fail-closed)")
+    func legacyRecordDecodesFailClosed() throws {
+        let json = #"{"allowlist":"a","config":"c","secrets":"s"}"#
+        let record = try JSONDecoder().decode(Trust.Record.self, from: Data(json.utf8))
+        #expect(record.devcontainer == nil)
+        let d = Trust.evaluate(
+            record: record, liveAllowlistHash: "a", liveConfigHash: "c",
+            liveSecretsHash: "s", liveDevcontainerHash: "dc")
+        #expect(d.allowlistTrusted)
+        #expect(!d.devcontainerTrusted)
+    }
 }
 
 @Suite("Trust store + gating (FS, BOX_DIR temp)", .serialized)
@@ -217,6 +257,71 @@ struct TrustStoreTests {
             let decision = ProjectTrust.evaluate(cwd: cwd)
             #expect(decision.allowlistTrusted)
             #expect(!decision.configTrusted)  // no config file at all
+        }
+    }
+
+    @Test("key(forProjectDir:) equals the box-dir wrapper applied to its parent")
+    func keyForProjectDirEquivalence() {
+        let projectDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("box-key-\(UUID().uuidString)")
+        let boxDir = projectDir.appendingPathComponent(".box")
+        #expect(
+            TrustStore.key(forProjectDir: projectDir)
+                == TrustStore.key(forProjectBoxDir: boxDir))
+    }
+
+    @Test("devcontainer-only project: discover anchors at cwd/.box without creating it")
+    func devcontainerOnlyAnchor() throws {
+        try withTempBoxDir { _ in
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("box-dconly-\(UUID().uuidString)")
+            let repo = root.appendingPathComponent("repo")
+            let dc = repo.appendingPathComponent(".devcontainer")
+            try FileManager.default.createDirectory(at: dc, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try Data(#"{"image":"swift:5.10"}"#.utf8).write(
+                to: dc.appendingPathComponent("devcontainer.json"))
+
+            let d = try #require(ProjectTrust.discover(cwd: repo))
+            #expect(d.boxDir.lastPathComponent == ".box")
+            #expect(
+                d.boxDir.deletingLastPathComponent().standardizedFileURL.path
+                    == repo.standardizedFileURL.path)
+            #expect(d.devcontainerURL != nil)
+            #expect(d.devcontainerHash != nil)
+            #expect(d.allowlistHash == nil)
+
+            try TrustStore.setRecord(
+                Trust.Record(devcontainer: d.devcontainerHash), forProjectBoxDir: d.boxDir)
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: repo.appendingPathComponent(".box").path))
+
+            let decision = ProjectTrust.evaluate(cwd: repo)
+            #expect(decision.devcontainerTrusted)
+            #expect(!decision.allowlistTrusted)
+        }
+    }
+
+    @Test("editing devcontainer.json after trust re-blocks it (fail-closed)")
+    func devcontainerEditInvalidates() throws {
+        try withTempBoxDir { _ in
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("box-dcedit-\(UUID().uuidString)")
+            let repo = root.appendingPathComponent("repo")
+            let dc = repo.appendingPathComponent(".devcontainer")
+            try FileManager.default.createDirectory(at: dc, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let dcFile = dc.appendingPathComponent("devcontainer.json")
+            try Data(#"{"image":"swift:5.10"}"#.utf8).write(to: dcFile)
+
+            let d = try #require(ProjectTrust.discover(cwd: repo))
+            try TrustStore.setRecord(
+                Trust.Record(devcontainer: d.devcontainerHash), forProjectBoxDir: d.boxDir)
+            #expect(ProjectTrust.evaluate(cwd: repo).devcontainerTrusted)
+
+            try Data(#"{"image":"swift:6.0"}"#.utf8).write(to: dcFile)
+            #expect(!ProjectTrust.evaluate(cwd: repo).devcontainerTrusted)
         }
     }
 }

@@ -1,0 +1,9 @@
+# box-proxy sample allowlist (fixture)
+# exact host:
+pypi.org
+# host + all subdomains:
+.example.com
+.github.com
+
+# blank lines and comments above are ignored
+files.pythonhosted.org

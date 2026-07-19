@@ -32,10 +32,24 @@ public enum Trust {
         /// Approved hash of the project `.box/config.json` (gates the dangerous
         /// `extraMounts`/`env`/`readOnlyRoots`); `nil` under `--allowlist-only`.
         public var config: String?
+        /// Approved hash of the project `.box/secrets.json` (gates whether the
+        /// project's declared *secret requirements* are honored). `nil` under
+        /// `--allowlist-only`, or when the project ships no secrets.json. A
+        /// requirement only ever asks the human to provide a value — it can never
+        /// carry one — but we still gate it so an edited declaration (changed
+        /// scope/host) re-blocks until re-approved. Optional so old records that
+        /// predate this field decode as `nil`.
+        public var secrets: String?
+        public var devcontainer: String?
 
-        public init(allowlist: String? = nil, config: String? = nil) {
+        public init(
+            allowlist: String? = nil, config: String? = nil,
+            secrets: String? = nil, devcontainer: String? = nil
+        ) {
             self.allowlist = allowlist
             self.config = config
+            self.secrets = secrets
+            self.devcontainer = devcontainer
         }
     }
 
@@ -45,10 +59,18 @@ public enum Trust {
         public let allowlistTrusted: Bool
         /// Honor the project config (extraMounts/env/readOnlyRoots/etc.).
         public let configTrusted: Bool
+        /// Honor the project's declared secret requirements (`.box/secrets.json`).
+        public let secretsTrusted: Bool
+        public let devcontainerTrusted: Bool
 
-        public init(allowlistTrusted: Bool, configTrusted: Bool) {
+        public init(
+            allowlistTrusted: Bool, configTrusted: Bool,
+            secretsTrusted: Bool = false, devcontainerTrusted: Bool = false
+        ) {
             self.allowlistTrusted = allowlistTrusted
             self.configTrusted = configTrusted
+            self.secretsTrusted = secretsTrusted
+            self.devcontainerTrusted = devcontainerTrusted
         }
     }
 
@@ -89,18 +111,24 @@ public enum Trust {
     public static func evaluate(
         record: Record?,
         liveAllowlistHash: String?,
-        liveConfigHash: String?
+        liveConfigHash: String?,
+        liveSecretsHash: String? = nil,
+        liveDevcontainerHash: String? = nil
     ) -> Decision {
         func trusted(_ approved: String?, _ live: String?) -> Bool {
             guard let approved, let live else { return false }
             return approved == live
         }
         guard let record else {
-            return Decision(allowlistTrusted: false, configTrusted: false)
+            return Decision(
+                allowlistTrusted: false, configTrusted: false,
+                secretsTrusted: false, devcontainerTrusted: false)
         }
         return Decision(
             allowlistTrusted: trusted(record.allowlist, liveAllowlistHash),
-            configTrusted: trusted(record.config, liveConfigHash)
+            configTrusted: trusted(record.config, liveConfigHash),
+            secretsTrusted: trusted(record.secrets, liveSecretsHash),
+            devcontainerTrusted: trusted(record.devcontainer, liveDevcontainerHash)
         )
     }
 }
@@ -117,8 +145,12 @@ public enum TrustStore {
     /// The project-dir key: the absolute, symlink-resolved path of the directory
     /// that *contains* the `.box/` (i.e. the `.box`'s parent). Resolving symlinks
     /// keeps the key stable regardless of how the user `cd`'d in.
+    public static func key(forProjectDir projectDir: URL) -> String {
+        projectDir.resolvingSymlinksInPath().path
+    }
+
     public static func key(forProjectBoxDir boxDir: URL) -> String {
-        boxDir.deletingLastPathComponent().resolvingSymlinksInPath().path
+        key(forProjectDir: boxDir.deletingLastPathComponent())
     }
 
     /// Load the full key→record map (empty if the file is absent/invalid).
@@ -161,10 +193,16 @@ public enum ProjectTrust {
         public let allowlistURL: URL
         /// `.box/config.json` (may not exist).
         public let configURL: URL
+        /// `.box/secrets.json` — the project's declared secret requirements (may not exist).
+        public let secretsURL: URL
+        public let devcontainerURL: URL?
         /// Live `sha256(path+contents)` of the allowlist, or nil if absent.
         public let allowlistHash: String?
         /// Live `sha256(path+contents)` of the config, or nil if absent.
         public let configHash: String?
+        /// Live `sha256(path+contents)` of secrets.json, or nil if absent.
+        public let secretsHash: String?
+        public let devcontainerHash: String?
     }
 
     /// Hash a component file using its absolute path; nil if the file is absent.
@@ -178,17 +216,28 @@ public enum ProjectTrust {
     /// `.box/` is found.
     public static func discover(cwd: URL) -> Discovered? {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        guard let boxDir = Config.projectConfigDir(startingFrom: cwd, stopAt: home) else {
+        let devcontainerURL = Devcontainer.detect(projectRoot: cwd)
+        let boxDir: URL
+        if let found = Config.projectConfigDir(startingFrom: cwd, stopAt: home) {
+            boxDir = found
+        } else if devcontainerURL != nil {
+            boxDir = cwd.appendingPathComponent(".box", isDirectory: true)
+        } else {
             return nil
         }
         let allowlistURL = boxDir.appendingPathComponent("allowlist.txt")
         let configURL = boxDir.appendingPathComponent("config.json")
+        let secretsURL = boxDir.appendingPathComponent("secrets.json")
         return Discovered(
             boxDir: boxDir,
             allowlistURL: allowlistURL,
             configURL: configURL,
+            secretsURL: secretsURL,
+            devcontainerURL: devcontainerURL,
             allowlistHash: liveHash(of: allowlistURL),
-            configHash: liveHash(of: configURL)
+            configHash: liveHash(of: configURL),
+            secretsHash: liveHash(of: secretsURL),
+            devcontainerHash: devcontainerURL.flatMap { liveHash(of: $0) }
         )
     }
 
@@ -196,13 +245,17 @@ public enum ProjectTrust {
     /// discovered project, nothing is trusted (global-only).
     public static func evaluate(_ discovered: Discovered?) -> Trust.Decision {
         guard let d = discovered else {
-            return Trust.Decision(allowlistTrusted: false, configTrusted: false)
+            return Trust.Decision(
+                allowlistTrusted: false, configTrusted: false,
+                secretsTrusted: false, devcontainerTrusted: false)
         }
         let record = TrustStore.record(forProjectBoxDir: d.boxDir)
         return Trust.evaluate(
             record: record,
             liveAllowlistHash: d.allowlistHash,
-            liveConfigHash: d.configHash
+            liveConfigHash: d.configHash,
+            liveSecretsHash: d.secretsHash,
+            liveDevcontainerHash: d.devcontainerHash
         )
     }
 

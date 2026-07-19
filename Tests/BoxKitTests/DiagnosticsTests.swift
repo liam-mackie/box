@@ -18,7 +18,10 @@ private func healthyProbe(
     },
     pathExists: @escaping @Sendable (String) -> Bool = { _ in true },
     imageInStore: Bool = true,
-    vminitReachable: Bool = true
+    vminitReachable: Bool = true,
+    fileContents: @escaping @Sendable (String) -> String? = { path in
+        path == BoxNet.resolverFile ? BoxNet.resolverFileContents() : nil
+    }
 ) -> Probe {
     Probe(
         machine: { machine },
@@ -30,7 +33,8 @@ private func healthyProbe(
         commandOutput: commandOutput,
         pathExists: pathExists,
         imageInStore: { imageInStore },
-        vminitReachable: { vminitReachable }
+        vminitReachable: { vminitReachable },
+        fileContents: fileContents
     )
 }
 
@@ -166,6 +170,27 @@ struct DiagnosticsCheckTests {
         #expect(r.status == .warn)
         #expect(!r.hard)
         #expect(r.remediation?.contains("box login") == true)
+    }
+
+    @Test("a present, current .box resolver passes")
+    func netResolverPresent() {
+        #expect(Diagnostics.checkNetResolver(healthyProbe()).status == .pass)
+    }
+
+    @Test("an absent .box resolver warns with the net init remediation")
+    func netResolverAbsent() {
+        let r = Diagnostics.checkNetResolver(healthyProbe(fileContents: { _ in nil }))
+        #expect(r.status == .warn)
+        #expect(!r.hard)
+        #expect(r.remediation?.contains("sudo box net init") == true)
+    }
+
+    @Test("a stale .box resolver (wrong port) warns without failing")
+    func netResolverStale() {
+        let r = Diagnostics.checkNetResolver(
+            healthyProbe(fileContents: { _ in "nameserver 127.0.0.1\nport 9999\n" }))
+        #expect(r.status == .warn)
+        #expect(!r.hard)
     }
 }
 

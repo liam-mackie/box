@@ -97,6 +97,83 @@ struct EgressLogParseTests {
     }
 }
 
+@Suite("EgressLog.parse (Envoy)")
+struct EgressLogEnvoyTests {
+    static let envoyAllowed =
+        "1700000000.123 10.0.0.2 -/200 81920 CONNECT api.anthropic.com:443 -"
+    static let envoyDenied =
+        "1700000001.000 10.0.0.2 UAEX/403 419 CONNECT blocked.example.com:443 -"
+    static let envoyCommaDenied =
+        "1700000002.000 10.0.0.2 DC,UAEX/403 419 CONNECT other.example.net:443 -"
+
+    @Test("parses an allowed Envoy CONNECT line")
+    func allowedRow() {
+        let e = EgressLog.parseLine(Self.envoyAllowed)
+        #expect(e?.timestamp == Date(timeIntervalSince1970: 1700000000.123))
+        #expect(e?.client == "10.0.0.2")
+        #expect(e?.resultCode == "-")
+        #expect(e?.httpStatus == 200)
+        #expect(e?.bytes == 81920)
+        #expect(e?.method == "CONNECT")
+        #expect(e?.host == "api.anthropic.com")
+        #expect(e?.sni == nil)
+        #expect(e?.isDenied == false)
+    }
+
+    @Test("parses an RBAC-denied Envoy line (UAEX flag)")
+    func deniedRow() {
+        let e = EgressLog.parseLine(Self.envoyDenied)
+        #expect(e?.resultCode == "UAEX")
+        #expect(e?.httpStatus == 403)
+        #expect(e?.method == "CONNECT")
+        #expect(e?.client == "10.0.0.2")
+        #expect(e?.bytes == 419)
+        #expect(e?.host == "blocked.example.com")
+        #expect(e?.isDenied == true)
+    }
+
+    @Test("treats a comma-joined flag set as denied")
+    func commaFlagsDenied() {
+        let e = EgressLog.parseLine(Self.envoyCommaDenied)
+        #expect(e?.resultCode == "DC,UAEX")
+        #expect(e?.host == "other.example.net")
+        #expect(e?.isDenied == true)
+    }
+
+    @Test("treats a flagless 403 CONNECT as denied (observed RBAC shape)")
+    func flaglessConnect403Denied() {
+        let e = EgressLog.parseLine(
+            "1784460144.149 192.168.69.10 -/403 19 CONNECT example.org:443 -")
+        #expect(e?.resultCode == "-")
+        #expect(e?.httpStatus == 403)
+        #expect(e?.host == "example.org")
+        #expect(e?.isDenied == true)
+    }
+
+    @Test("a non-CONNECT upstream 403 stays not-denied")
+    func upstream403NotDenied() {
+        let e = EgressLog.parseLine(
+            "1700000003.000 10.0.0.2 TCP_MISS/403 512 GET http://x.example.com/p - HIER_DIRECT/1.2.3.4 text/html")
+        #expect(e?.httpStatus == 403)
+        #expect(e?.isDenied == false)
+    }
+
+    @Test("parses a stream mixing stock, custom, and Envoy lines")
+    func mixedStream() {
+        let entries = EgressLog.parse([
+            EgressLogParseTests.stockAllowed,
+            EgressLogParseTests.boxConnectWithSNI,
+            Self.envoyAllowed,
+            Self.envoyDenied,
+        ])
+        #expect(entries.count == 4)
+        #expect(
+            entries.map(\.host)
+                == ["example.com", "api.anthropic.com", "api.anthropic.com", "blocked.example.com"])
+        #expect(entries.map(\.isDenied) == [false, false, false, true])
+    }
+}
+
 @Suite("EgressLog.summarize")
 struct EgressLogSummarizeTests {
     func entries() -> [EgressEntry] {
@@ -266,5 +343,16 @@ struct DeniedReportTests {
             perBox: [("box-x-1", [Self.allowed, "", "# comment", "garbage line"])],
             shared: [Self.allowed])
         #expect(report.isEmpty)
+    }
+
+    @Test("attributes shared sidecar Envoy denials to the shared-proxy session")
+    func sharedProxyAttribution() {
+        let report = EgressLog.deniedReport(
+            perBox: [(Daemon.sharedLogID, [EgressLogEnvoyTests.envoyDenied])],
+            shared: [])
+        #expect(report.count == 1)
+        #expect(report[0].host == "blocked.example.com")
+        #expect(report[0].count == 1)
+        #expect(report[0].sessions == ["shared-proxy"])
     }
 }

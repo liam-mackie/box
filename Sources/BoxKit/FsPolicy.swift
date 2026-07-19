@@ -16,7 +16,7 @@ import Foundation
 ///  - An already-open file descriptor survives a `umount` — the reconcile uses a
 ///    lazy unmount (`umount -l`) and accepts the race for a file open across the
 ///    moment a deny lands.
-///  - There is a ≤2s window between a host `fs-deny` and the carve taking effect.
+///  - There is a ≤2s window between a host `box fs deny` and the carve taking effect.
 ///  - A brand-new host root cannot appear live (Containerization 0.33.1 cannot
 ///    hot-plug a mount); adding one needs a box restart. For real secrets,
 ///    exclude them at create time via a scoped `readOnlyRoots`.
@@ -85,7 +85,7 @@ public enum FsPolicy {
     }
 
     /// Serialize rules back to file text (one `verb path` per line, sorted by
-    /// path then verb for a stable diff). Used by `box fs-allow`/`fs-deny`.
+    /// path then verb for a stable diff). Used by `box fs allow`/`fs deny`.
     public static func serialize(_ rules: [Rule]) -> String {
         let sorted = canonicalOrder(rules)
         return sorted.map { "\($0.verb.rawValue) \($0.path)" }.joined(separator: "\n")
@@ -99,7 +99,7 @@ public enum FsPolicy {
         }
     }
 
-    // MARK: - Merge (the `box fs-allow`/`fs-deny` edit)
+    // MARK: - Merge (the `box fs allow`/`fs deny` edit)
 
     /// Result of folding a new rule into an existing rule set.
     public struct MergeResult: Equatable, Sendable {

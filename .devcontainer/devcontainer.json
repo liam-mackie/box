@@ -1,0 +1,21 @@
+// Swift dev toolchain for this repo, kept to the subset box's `--devcontainer`
+// flag honors (an `image:` base + `postCreateCommand` — see Devcontainer.swift).
+// The base must stay debian-family (apt + glibc); bookworm matches the glibc
+// box's squid-from-source layer is compiled against (assets/files/box-layers.dockerfile).
+//
+// Note: the full `box` binary itself only builds on macOS 26 (Containerization,
+// CryptoKit, codesign) — this container is for Swift work on Linux: building and
+// testing Swift packages, swift-format, sourcekit-lsp.
+{
+    "name": "box (Swift 6.3, bookworm)",
+    "image": "swift:6.3-bookworm",
+    // Tools the toolchain image lacks (Makefile needs make + git for `git describe`).
+    // box turns this into a build-time RUN layer; VS Code runs it once after create.
+    // Both run as root — the swift image's default user — so no sudo needed.
+    "postCreateCommand": "apt-get update && apt-get install -y --no-install-recommends make git curl ca-certificates jq less && rm -rf /var/lib/apt/lists/*",
+    "customizations": {
+        "vscode": {
+            "extensions": ["swiftlang.swift-vscode"]
+        }
+    }
+}

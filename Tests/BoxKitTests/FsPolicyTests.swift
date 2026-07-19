@@ -253,9 +253,9 @@ struct FsPolicyReconcileTests {
     }
 }
 
-/// Filesystem wrapper: `box fs-allow`/`fs-deny` edit the host policy file under
-/// `Box.configDir` (which is mounted at /etc/box), and `fs-policy` reads it back.
-@Suite("Commands fs-policy (filesystem wrapper)")
+/// Filesystem wrapper: `box fs allow`/`fs deny` edit the host policy file under
+/// `Box.configDir` (which is mounted at /etc/box), and `fs policy` reads it back.
+@Suite("Commands fs policy (filesystem wrapper)")
 struct FsPolicyCommandTests {
     @Test("Box.fsPolicy is under Box.configDir (so it rides the /etc/box mount)")
     func policyUnderConfigDir() throws {
@@ -265,7 +265,7 @@ struct FsPolicyCommandTests {
         }
     }
 
-    @Test("fs-deny then fs-allow writes a normalized, toggling policy file")
+    @Test("fs deny then fs allow writes a normalized, toggling policy file")
     func denyThenAllowWritesFile() throws {
         try withTempBoxDir { _ in
             try Commands.editFsPolicy(verb: .deny, path: "/mnt/g/secret/")

@@ -39,8 +39,10 @@ public struct EgressEntry: Equatable, Sendable {
         self.sni = sni
     }
 
-    /// True if squid blocked this request (off-allowlist or otherwise denied).
-    public var isDenied: Bool { resultCode.contains("DENIED") }
+    public var isDenied: Bool {
+        resultCode.contains("DENIED") || resultCode.contains("UAEX")
+            || (method == "CONNECT" && httpStatus == 403)
+    }
 
     /// The destination host: prefer the real SNI, then the host part of a
     /// `host:port` CONNECT target, then the host component of an http(s) URL.
@@ -124,15 +126,14 @@ public enum EgressLog {
         return Date(timeIntervalSince1970: secs)
     }
 
-    /// A field shaped like `WORD/NNN` where WORD looks like a squid result code
-    /// (upper-case + `_`) and NNN is the numeric HTTP status.
     static func isCodeStatus(_ field: String) -> Bool {
         guard let slash = field.firstIndex(of: "/") else { return false }
         let code = field[..<slash]
         let status = field[field.index(after: slash)...]
         guard !code.isEmpty, !status.isEmpty, Int(status) != nil else { return false }
-        // Result codes are upper-case letters, digits, and underscores.
-        return code.allSatisfy { $0.isUppercase || $0.isNumber || $0 == "_" }
+        return code.allSatisfy {
+            $0.isUppercase || $0.isNumber || $0 == "_" || $0 == "," || $0 == "-"
+        }
     }
 
     static func splitCodeStatus(_ field: String) -> (String, Int)? {

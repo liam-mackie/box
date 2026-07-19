@@ -1,32 +1,40 @@
-# box: a Linux image that runs Claude Code inside an Apple `container`
-# microVM, with all outbound traffic forced through a hostname-allowlist proxy.
+# ── box-proxy build stage ───────────────────────────────────────────────────
+# box's egress sidecar is box-proxy: a hudsucker MITM forward proxy that enforces
+# the per-source allowlist, decrypts allowlisted (non-pinned) hosts to inject
+# scoped secrets and log full URLs, and tunnels pinned hosts untouched. Compiled
+# here from the embedded crate source; the openssl-ca + aws-lc-rs deps need cmake,
+# clang, perl and the OpenSSL headers at build time.
+FROM rust:1-bookworm AS proxybuild
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang perl pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY proxy/ ./
+RUN cargo build --release --locked && cp target/release/box-proxy /box-proxy
+
+# box: a Linux image that runs Claude Code inside an Apple `container` microVM,
+# with all outbound traffic forced through the box-proxy egress sidecar. The SAME
+# image runs in two roles (selected by BOX_ROLE, see entrypoint.sh):
+#   client — the agent VM: runs claude, no proxy; egress iptables-locked to the
+#            box-proxy sidecar it was told about.
+#   proxy  — the box-proxy egress sidecar (shared daemon-owned, or a per-box
+#            dedicated one): a MITM forward proxy over the per-source allowlist.
 FROM node:22-bookworm-slim
 
 # --- system deps -----------------------------------------------------------
-#  squid     : egress proxy that enforces the hostname allowlist.
-#              KNOWN LIMITATION: Debian's apt `squid` is built `--with-gnutls`,
-#              NOT `--with-openssl` (verified on the bookworm squid 5.7 base). The
-#              GnuTLS build does NOT support SSL-Bump (`http_port … ssl-bump` is a
-#              FATAL "Unknown http_port option") and ships no security_file_certgen
-#              helper. So SNI peek-and-splice + MITM are only available if/when this
-#              image is rebuilt against an openssl-enabled squid. We do NOT ship a
-#              broken proxy: the entrypoint runs a FUNCTIONAL `squid -k parse` probe
-#              of an ssl-bump line and, when it fails (the apt case), falls back to
-#              today's hostname-only (CONNECT host) filtering so the box still works.
-#              To get SNI/MITM, build squid `--with-openssl` (or swap in such a pkg).
-#  openssl   : generate the dummy self-signed cert SSL-Bump needs on its
-#              `http_port … tls-cert=` line (peek/splice never serves it to a
-#              client, but squid requires a cert to instantiate the TLS context).
-#  iptables  : default-deny firewall so nothing can bypass the proxy
-#  gosu      : drop from root -> non-root 'agent' after the firewall is up
-#  iproute2  : `ss` for the readiness check in the entrypoint
-#  ca-certificates : also gives us `update-ca-certificates` for the opt-in MITM CA
-# (the entrypoint polls the allowlist with md5sum/coreutils to hot-reconfigure
-#  squid, so no inotify package is needed)
+#  openssl / ca-certificates : the MITM CA (update-ca-certificates) + general TLS,
+#            and libssl3 at runtime for box-proxy (openssl-sys links it).
+#  iptables  : client-role default-deny egress firewall (lock traffic to the sidecar)
+#  gosu      : drop root -> non-root 'agent' after the firewall is up
+#  iproute2  : `ss`/`ip` for readiness checks and gateway discovery
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        squid openssl iptables iproute2 dnsutils ca-certificates curl wget git \
-        python3 python3-pip python3-venv gosu jq less procps \
+        openssl iptables iproute2 dnsutils ca-certificates curl wget git \
+        gosu less procps \
     && rm -rf /var/lib/apt/lists/*
+
+# --- box-proxy: the egress sidecar binary (proxy role) ---------------------
+COPY --from=proxybuild /box-proxy /usr/local/bin/box-proxy
+RUN /usr/local/bin/box-proxy --version
 
 # --- Claude Code (native build, NOT npm) -----------------------------------
 # The official installer downloads the self-contained native binary — no npm
@@ -34,9 +42,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # trip over (box disables that updater anyway and keeps this version in sync
 # with the host's claude itself). `box update [--to <ver>]` / the launch-time
 # sync override CLAUDE_VERSION; changing it invalidates only this layer.
-# HOME=/opt/claude keeps the install out of /home/agent — which the persisted
-# agent-home mount hides at runtime — and out of /root (0700); the launcher is
-# then exposed on PATH and the tree made world-readable for the agent.
 ARG CLAUDE_VERSION=latest
 RUN mkdir -p /opt/claude \
     && HOME=/opt/claude bash -c "curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_VERSION}" \
@@ -49,44 +54,9 @@ RUN mkdir -p /opt/claude \
 # bind-mounted /workspace are owned by you on the host (no root-owned files).
 RUN useradd -m -u 501 -s /bin/bash agent
 
-# --- squid: config, allowlist, and the custom "blocked" page ---------------
-COPY squid.conf /etc/squid/squid.conf
+# --- global egress allowlist (seeded on first run; live-editable via box allow) --
 RUN mkdir -p /etc/box
 COPY config/allowlist.txt /etc/box/allowlist.txt
-# Replace squid's default ACCESS_DENIED page with our actionable one, in every
-# language dir squid ships, so the agent sees the fix instructions on a block.
-COPY deny.html /tmp/deny.html
-RUN find /usr/share/squid/errors -name ERR_ACCESS_DENIED -exec cp /tmp/deny.html {} \; \
-    && mkdir -p /var/log/squid /var/spool/squid \
-    && chown -R proxy:proxy /var/log/squid /var/spool/squid
-
-# --- SSL-Bump: dummy splice cert + leaf-cert DB ----------------------------
-# SSL-Bump's `http_port … ssl-bump tls-cert=` needs a cert to build squid's TLS
-# context even when we only peek/splice (the cert is never served on a splice).
-# Generate a throwaway self-signed cert at BUILD time so first boot is fast and
-# no key generation happens in the agent's runtime path.
-#   /etc/squid/ssl/box-splice.pem  — combined key+cert, readable by proxy.
-# `generate-host-certificates=on` (set on the port line by the entrypoint when
-# MITM is enabled) makes squid forge leaf certs into a disk DB managed by the
-# `security_file_certgen` helper; pre-create + initialize that DB here. Both are
-# guarded against the helper being absent on a hypothetical non-openssl squid.
-RUN mkdir -p /etc/squid/ssl \
-    && openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
-        -subj "/CN=box-splice/O=box" \
-        -keyout /etc/squid/ssl/box-splice.key \
-        -out    /etc/squid/ssl/box-splice.crt 2>/dev/null \
-    && cat /etc/squid/ssl/box-splice.key /etc/squid/ssl/box-splice.crt \
-        > /etc/squid/ssl/box-splice.pem \
-    && rm -f /etc/squid/ssl/box-splice.key /etc/squid/ssl/box-splice.crt \
-    && CERTGEN="$(command -v security_file_certgen || echo /usr/lib/squid/security_file_certgen)" \
-    && if [ -x "$CERTGEN" ]; then \
-           "$CERTGEN" -c -s /var/lib/squid/ssl_db -M 4MB || true; \
-       else \
-           echo "WARN: security_file_certgen not found — this squid build lacks SSL-Bump; box will fall back to hostname-only filtering at runtime." >&2; \
-           mkdir -p /var/lib/squid/ssl_db; \
-       fi \
-    && chmod 0640 /etc/squid/ssl/box-splice.pem \
-    && chown -R proxy:proxy /etc/squid/ssl /var/lib/squid/ssl_db
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

@@ -1,5 +1,6 @@
 import ArgumentParser
 import BoxKit
+import Foundation
 
 @main
 struct BoxCommand: AsyncParsableCommand {
@@ -13,11 +14,13 @@ struct BoxCommand: AsyncParsableCommand {
         subcommands: [
             Run.self, Shell.self, Exec.self, Login.self, Allow.self, Denied.self,
             Build.self, Ls.self, ConfigCmd.self,
-            Log.self, Doctor.self, Update.self, Version.self,
+            Log.self, Doctor.self, Update.self, Version.self, Completions.self,
             Stop.self, Rm.self, Prune.self,
             Trust.self, Untrust.self,
-            FsAllow.self, FsDeny.self, FsPolicy.self,
-            Ca.self,
+            Fs.self,
+            Secret.self,
+            Net.self, Resolver.self, NetProbeCmd.self,
+            SystemCmd.self, DaemonRun.self,
         ],
         defaultSubcommand: Run.self
     )
@@ -27,11 +30,24 @@ struct Run: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Launch Claude Code in the current directory (default).")
 
+    @Option(
+        name: .customLong("allow-local"),
+        help:
+            "Open scoped egress from the box to a Mac-local port (repeatable), e.g. --allow-local 1433. Reachable in the box as host.box:<port>. Must precede any claude arguments.")
+    var allowLocal: [String] = []
+
+    @Flag(
+        name: .customLong("devcontainer"),
+        help:
+            "Build on this project's .devcontainer base without trusting it first (auto-enabled when trusted).")
+    var devcontainer = false
+
     @Argument(parsing: .captureForPassthrough, help: "Extra arguments passed to `claude`.")
     var args: [String] = []
 
     func run() async throws {
-        let code = try await Commands.run(extraArgs: args)
+        let code = try await Commands.run(
+            extraArgs: args, allowLocal: allowLocal, devcontainer: devcontainer)
         throw ExitCode(code)
     }
 }
@@ -206,6 +222,46 @@ struct Version: AsyncParsableCommand {
     func run() throws { try Commands.version(refresh: refresh) }
 }
 
+struct Completions: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "completions",
+        abstract: "Print the shell completion script (bash, zsh, or fish).",
+        discussion: """
+            Prints to stdout by default. With --install, writes to the shell's \
+            conventional completion directory (creating it as needed) and prints \
+            the path.
+            """)
+
+    @Argument(help: "Shell to target — bash, zsh, or fish (default: from $SHELL).")
+    var shell: String?
+
+    @Flag(name: .long, help: "Install into the shell's completion directory instead of printing.")
+    var install = false
+
+    func run() throws {
+        let target = try Commands.completionShell(
+            argument: shell, shellEnv: ProcessInfo.processInfo.environment["SHELL"])
+        let script = BoxCommand.completionScript(for: target.parserShell)
+        guard install else {
+            print(script, terminator: "")
+            return
+        }
+        let path = try Commands.installCompletion(target, script: script)
+        print("wrote \(path.path)")
+        if target == .zsh, let hint = Commands.zshInstallHint() { print(hint) }
+    }
+}
+
+extension BoxKit.CompletionShell {
+    var parserShell: ArgumentParser.CompletionShell {
+        switch self {
+        case .bash: return .bash
+        case .zsh: return .zsh
+        case .fish: return .fish
+        }
+    }
+}
+
 struct Stop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Stop a running box (graceful teardown).")
@@ -273,9 +329,16 @@ struct Untrust: AsyncParsableCommand {
     func run() throws { try Commands.untrust() }
 }
 
+struct Fs: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "fs",
+        abstract: "Show or hide subpaths of the broad read-only roots (live).",
+        subcommands: [FsAllow.self, FsDeny.self, FsPolicy.self])
+}
+
 struct FsAllow: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "fs-allow",
+        commandName: "allow",
         abstract: "Make a subpath visible under the broad read-only root (live).")
 
     @Argument(help: "Path to allow.")
@@ -286,7 +349,7 @@ struct FsAllow: AsyncParsableCommand {
 
 struct FsDeny: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "fs-deny",
+        commandName: "deny",
         abstract: "Hide a subpath under the broad read-only root (live).")
 
     @Argument(help: "Path to deny.")
@@ -297,22 +360,258 @@ struct FsDeny: AsyncParsableCommand {
 
 struct FsPolicy: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "fs-policy",
+        commandName: "policy",
         abstract: "Show the current dynamic filesystem visibility policy.")
 
     func run() throws { try Commands.fsPolicy() }
 }
 
-struct Ca: AsyncParsableCommand {
+struct Net: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Manage the opt-in MITM CA used for path-level egress rules.",
-        subcommands: [CaInit.self])
+        abstract: "Set up `.box` name resolution and look up box IPs.",
+        subcommands: [NetInit.self, Ip.self])
 }
 
-struct CaInit: AsyncParsableCommand {
+struct NetInit: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "init",
-        abstract: "Generate a CA in ~/.box/ca for squid to forge leaf certs.")
+        abstract: "Install /etc/resolver/box so <box-id>.box resolves on the Mac (needs sudo).")
 
-    func run() throws { try Commands.caInit() }
+    func run() throws { try Commands.netInit() }
+}
+
+struct Ip: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "ip",
+        abstract: "Print a running box's guest IP.")
+
+    @Option(name: .long, help: "The box id (default: the box for this dir, or the only one).")
+    var box: String?
+    @Flag(name: .long, help: "List every running box (IP and <id>.box).")
+    var all = false
+
+    func run() throws { try Commands.boxIP(box: box, all: all) }
+}
+
+/// Hidden entry point for the singleton `.box` DNS resolver, spawned detached by
+/// `box run`. Not shown in help.
+struct Resolver: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__resolver", shouldDisplay: false)
+
+    func run() throws { try Commands.runResolver() }
+}
+
+struct SystemCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "system",
+        abstract: "Manage the box daemon (required for `box run`).",
+        discussion: """
+            box runs egress through a daemon-owned Envoy proxy sidecar, shared by \
+            all boxes with per-source isolation. Like `container system start`, \
+            the daemon is a REQUIRED service you start explicitly — `box run` \
+            errors if it's down (no auto-start, no fallback). Boxes attach at \
+            launch; stopping the daemon leaves running boxes without egress until \
+            restarted. (`dedicatedProxy` in config gives a box its own sidecar and \
+            does not need the daemon.)
+            """,
+        subcommands: [SystemStart.self, SystemStop.self, SystemStatus.self])
+}
+
+struct SystemStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "start", abstract: "Start the box daemon and its shared Envoy sidecar.")
+
+    func run() throws {
+        if DaemonClient.isRunning() {
+            print("box daemon: already running")
+            return
+        }
+        print("box daemon: starting (booting the shared egress sidecar)…")
+        try DaemonClient.start()
+        print("box daemon: started")
+    }
+}
+
+struct SystemStatus: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "status", abstract: "Show the daemon's sidecar and attached boxes.")
+
+    func run() throws {
+        let s: BoxKit.Daemon.Response
+        do {
+            s = try DaemonClient.status()
+        } catch {
+            print("box daemon: not running — start it with `box system start`")
+            return
+        }
+        print("box daemon: running (version \(s.version ?? "?"))")
+        print("  subnet:  \(s.subnet ?? "?")")
+        print("  sidecar: \(s.sidecarIP ?? "?"):3128")
+        let boxes = s.boxes ?? [:]
+        print("  boxes:   \(boxes.isEmpty ? "none" : "")")
+        for (id, ip) in boxes.sorted(by: { $0.key < $1.key }) {
+            print("    \(id)\t\(ip)")
+        }
+    }
+}
+
+struct SystemStop: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "stop", abstract: "Stop the daemon and its shared sidecar.")
+
+    @Flag(name: .long, help: "Stop even with boxes attached (their egress breaks).")
+    var force = false
+
+    func run() throws {
+        let resp: BoxKit.Daemon.Response
+        do {
+            resp = try DaemonClient.stop(force: force)
+        } catch {
+            print("box daemon: not running")
+            return
+        }
+        if resp.ok {
+            print("box daemon: stopping")
+        } else {
+            print("box daemon: \(resp.error ?? "refused")")
+            throw ExitCode(1)
+        }
+    }
+}
+
+/// Hidden entry point for the daemon process itself, spawned detached by the
+/// first `box run` that needs it (or manually for debugging). Not shown in help.
+struct DaemonRun: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__daemon", shouldDisplay: false)
+
+    func run() async throws { try await BoxKit.Daemon.run() }
+}
+
+/// Hidden diagnostic: probe direct guest→guest TCP on a shared VmnetNetwork
+/// (decides whether split mode needs the host relay). See NetProbe.swift.
+struct NetProbeCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "__netprobe", shouldDisplay: false)
+
+    @Flag(name: .long, help: "Inspect vmnet network serialization instead of the TCP probe.")
+    var inspect = false
+    @Flag(name: .long, help: "Cross-process probe: serve+join via a spawned child.")
+    var cross = false
+    @Option(name: .customLong("cross-serve"), help: "Internal: serve half, artifacts dir.")
+    var crossServe: String?
+    @Option(name: .customLong("cross-join"), help: "Internal: join half, artifacts dir.")
+    var crossJoin: String?
+
+    func run() async throws {
+        if inspect {
+            try NetProbe.inspectSerialization()
+            return
+        }
+        if let dir = crossServe {
+            try await NetProbeCross.serve(dir: dir)
+            return
+        }
+        if let dir = crossJoin {
+            throw ExitCode(try await NetProbeCross.join(dir: dir))
+        }
+        if cross {
+            throw ExitCode(try await NetProbeCross.orchestrate())
+        }
+        let code = try await NetProbe.run()
+        throw ExitCode(code)
+    }
+}
+
+struct Secret: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Manage proxy-injected credentials Claude can use but never see.",
+        discussion: """
+            box injects a secret's value into matching requests at the egress proxy \
+            (scoped by host and URL path), so Claude gets its use without its value. \
+            Requires `box ca init` + tlsInspect (path-level injection needs TLS bump). \
+            Projects can declare the secrets they need in .box/secrets.json; run \
+            `box secret setup` to provide values.
+            """,
+        subcommands: [
+            SecretSet.self, SecretSetup.self, SecretList.self, SecretShow.self, SecretRm.self,
+        ])
+}
+
+struct SecretSet: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "set",
+        abstract: "Define a secret and bind its value source (env var or Keychain).")
+
+    @Argument(help: "Secret name (letters, digits, _ and -).")
+    var name: String
+
+    @Option(name: .customLong("from-env"), help: "Read the value from this host env var at launch.")
+    var fromEnv: String?
+    @Option(
+        name: .customLong("from-keychain"),
+        help: "Read from a Keychain generic password (service[/account]).")
+    var fromKeychain: String?
+
+    @Option(name: .customLong("as"), help: "Injection location: header | cookie | query.")
+    var location: String = "header"
+    @Option(
+        name: .customLong("name"),
+        help: "Field name (header/cookie/query-param). Default: Authorization.")
+    var field: String?
+    @Option(name: .long, help: "Value template, e.g. \"Bearer ${value}\" or \"${value|base64}\".")
+    var template: String?
+
+    @Option(name: .long, help: "Host to inject on (repeatable).")
+    var host: [String] = []
+    @Option(name: .customLong("path-prefix"), help: "Only inject on paths under this prefix.")
+    var pathPrefix: String?
+    @Option(name: .customLong("path-regex"), help: "Only inject on paths matching this regex.")
+    var pathRegex: String?
+
+    func run() throws {
+        try Commands.secretSet(
+            name: name, fromEnv: fromEnv, fromKeychain: fromKeychain,
+            location: location, field: field, template: template,
+            hosts: host, pathPrefix: pathPrefix, pathRegex: pathRegex)
+    }
+}
+
+struct SecretSetup: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "setup",
+        abstract: "Interactively provide values for any declared-but-unset secrets.")
+
+    func run() throws { try Commands.secretSetup() }
+}
+
+struct SecretList: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "ls",
+        abstract: "List defined secrets and their scopes (never values).")
+
+    func run() throws { Commands.secretList() }
+}
+
+struct SecretShow: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "show",
+        abstract: "Show one secret's injection spec and status (never its value).")
+
+    @Argument(help: "Secret name.")
+    var name: String
+
+    func run() throws { try Commands.secretShow(name: name) }
+}
+
+struct SecretRm: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "rm",
+        abstract: "Remove a global secret (requirement + binding).")
+
+    @Argument(help: "Secret name.")
+    var name: String
+
+    func run() throws { try Commands.secretRemove(name: name) }
 }

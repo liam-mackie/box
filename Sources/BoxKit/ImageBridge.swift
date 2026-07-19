@@ -132,6 +132,92 @@ enum ImageBridge {
         try await loadIntoStore(store: store, imageRef: variantRef)
     }
 
+    /// Build (or reuse) the slim CLIENT image for `--devcontainer` split mode:
+    /// the project's devcontainer base + Claude Code + the client entrypoint —
+    /// no squid (that runs in the proxy sidecar, see `Runner`). Keyed by a
+    /// content hash of the devcontainer inputs AND the box-layers template
+    /// (`box:dc-<sha8>`), so a box upgrade that changes the layers invalidates
+    /// cached variants; store-existence is the cache. v1 supports a devcontainer
+    /// `image:` base; a `build.dockerfile`-only devcontainer isn't supported yet.
+    ///
+    /// The generated Dockerfile is `assets/files/box-layers.dockerfile` with the
+    /// base substituted; the build context is a fresh temp dir holding the two
+    /// asset files the template COPYs plus that Dockerfile. The base must be
+    /// debian-family (apt); a uid-501 collision is reused.
+    static func ensureDevcontainer(
+        store: ImageStore, spec: Devcontainer.Spec, hashInputs: [Data]
+    ) async throws -> Image {
+        guard let base = spec.image, !base.isEmpty else {
+            throw CBError(
+                "devcontainer: v1 supports a base `image:` only; a "
+                    + "build.dockerfile-only devcontainer isn't supported yet.")
+        }
+        try Assets.materialize()
+        let template = try String(
+            contentsOf: Box.dir.appendingPathComponent("box-layers.dockerfile"),
+            encoding: .utf8)
+        // Key the variant on EVERYTHING that shapes the image: the devcontainer
+        // inputs, the template, and the asset files the context COPYs — an
+        // entrypoint.sh fix must invalidate cached variants even though the
+        // template text itself is unchanged.
+        var tagInputs = hashInputs + [Data(template.utf8)]
+        for f in clientBuildAssets {
+            tagInputs.append(
+                (try? Data(contentsOf: Box.dir.appendingPathComponent(f))) ?? Data())
+        }
+        let tag = Devcontainer.variantTag(tagInputs)
+        let storeRef = "docker.io/library/box:\(tag)"
+        if let cached = try? await store.get(reference: storeRef, pull: false) {
+            return cached
+        }
+        guard Sh.exists("container") else {
+            throw CBError(
+                "the `container` CLI is required to build the image "
+                    + "(install it and run `container system start` once)")
+        }
+        FileHandle.standardError.write(
+            Data("box: building devcontainer client image box:\(tag) (base \(base))…\n".utf8))
+
+        let ctx = FileManager.default.temporaryDirectory
+            .appendingPathComponent("box-dc-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: ctx, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: ctx) }
+        try copyBuildAssets(into: ctx)
+
+        let dockerfile = Devcontainer.dockerfile(
+            base: base, template: template, postCreate: spec.postCreateCommands)
+        try dockerfile.write(
+            to: ctx.appendingPathComponent("Dockerfile"), atomically: true, encoding: .utf8)
+
+        // v1: install the latest claude in the variant (the launch-time host sync
+        // covers the base/toolchain images; dc-variant version pinning is a follow-up).
+        let imageRef = "box:\(tag)"
+        try buildImage(
+            ref: imageRef, context: ctx.path, noCache: false,
+            buildArgs: claudeBuildArgs(to: nil))
+        try await loadIntoStore(store: store, imageRef: imageRef)
+        return try await store.get(reference: storeRef, pull: false)
+    }
+
+    /// The asset files the box-layers template `COPY`s into the client image.
+    /// Also part of the dc variant hash (see `ensureDevcontainer`) so editing
+    /// one invalidates cached variants.
+    static let clientBuildAssets = ["entrypoint.sh", "xclip-shim.sh"]
+
+    /// Copy the asset files the box-layers template `COPY`s into a fresh build
+    /// context (from the materialized `Box.dir`). Best-effort per file. The slim
+    /// client image needs only the entrypoint and the xclip shim — squid and its
+    /// config live in the proxy sidecar's image.
+    static func copyBuildAssets(into ctx: URL) throws {
+        let fm = FileManager.default
+        for f in clientBuildAssets {
+            let src = Box.dir.appendingPathComponent(f)
+            guard fm.fileExists(atPath: src.path) else { continue }
+            try? fm.removeItem(at: ctx.appendingPathComponent(f))
+            try fm.copyItem(at: src, to: ctx.appendingPathComponent(f))
+        }
+    }
+
     /// Keep the image's baked claude-code at least as new as the host's `claude`
     /// (`syncClaudeVersion`, on by default). The guest cannot self-update — the
     /// global npm dir is root-owned and egress is allowlisted — so without this

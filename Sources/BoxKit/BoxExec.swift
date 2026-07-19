@@ -164,9 +164,11 @@ final class ExecServer: @unchecked Sendable {
     private let execCounter = Locked(0)
 
     /// Env the entrypoint would give the agent, minus TERM (per-connection).
-    /// See entrypoint.sh's final `gosu agent env …`.
-    static func agentEnv(cfg: Config) -> [String] {
-        let proxy = "http://127.0.0.1:3128"
+    /// See entrypoint.sh's final `gosu agent env …`. `proxyURL` is the agent's
+    /// egress proxy: local squid (single-VM) or the sidecar's vmnet IP (split)
+    /// (`--devcontainer` split mode), so exec sessions get the same egress path.
+    static func agentEnv(cfg: Config, proxyURL: String = "http://127.0.0.1:3128") -> [String] {
+        let proxy = proxyURL
         var env = [
             "HOME=/home/agent", "USER=agent", "LOGNAME=agent",
             "PATH=\(LinuxProcessConfiguration.defaultPath)",
@@ -189,11 +191,14 @@ final class ExecServer: @unchecked Sendable {
 
     /// Start serving, or return nil (with a warning) if the socket can't be
     /// created — the box still runs, just without exec support.
-    static func start(container: LinuxContainer, cfg: Config, cwd: String) -> ExecServer? {
+    static func start(
+        container: LinuxContainer, cfg: Config, cwd: String,
+        proxyURL: String = "http://127.0.0.1:3128"
+    ) -> ExecServer? {
         let url = ExecWire.socketURL(forPID: getpid())
         let server = ExecServer(
             container: container, cwd: cwd,
-            env: agentEnv(cfg: cfg), socketPath: url.path)
+            env: agentEnv(cfg: cfg, proxyURL: proxyURL), socketPath: url.path)
         do {
             try server.listen()
         } catch {

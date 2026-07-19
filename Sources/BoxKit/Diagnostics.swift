@@ -76,6 +76,7 @@ public struct Probe: Sendable {
     public var imageInStore: @Sendable () -> Bool
     /// Whether the vminit reference is reachable. Only run when `--online`.
     public var vminitReachable: @Sendable () -> Bool
+    public var fileContents: @Sendable (String) -> String?
 
     public init(
         machine: @escaping @Sendable () -> String,
@@ -87,7 +88,10 @@ public struct Probe: Sendable {
         commandOutput: @escaping @Sendable ([String]) -> String,
         pathExists: @escaping @Sendable (String) -> Bool,
         imageInStore: @escaping @Sendable () -> Bool,
-        vminitReachable: @escaping @Sendable () -> Bool
+        vminitReachable: @escaping @Sendable () -> Bool,
+        fileContents: @escaping @Sendable (String) -> String? = {
+            try? String(contentsOfFile: $0, encoding: .utf8)
+        }
     ) {
         self.machine = machine
         self.macOSMajorVersion = macOSMajorVersion
@@ -99,6 +103,7 @@ public struct Probe: Sendable {
         self.pathExists = pathExists
         self.imageInStore = imageInStore
         self.vminitReachable = vminitReachable
+        self.fileContents = fileContents
     }
 
     /// The real seams: subprocesses via `Sh`, env via the module `env(_:)`
@@ -113,7 +118,8 @@ public struct Probe: Sendable {
         commandOutput: { Diagnostics.combinedOutput($0) },
         pathExists: { FileManager.default.fileExists(atPath: $0) },
         imageInStore: { Diagnostics.imagePresentInStore() },
-        vminitReachable: { Diagnostics.vminitReferenceReachable() }
+        vminitReachable: { Diagnostics.vminitReferenceReachable() },
+        fileContents: { try? String(contentsOfFile: $0, encoding: .utf8) }
     )
 }
 
@@ -134,6 +140,7 @@ public enum Diagnostics {
             checkEntitlement(probe),
             checkLocation(probe),
             checkImage(probe),
+            checkNetResolver(probe),
         ]
         if online {
             results.append(checkVminit(probe))
@@ -288,6 +295,18 @@ public enum Diagnostics {
                 ? nil
                 : "No Claude credentials found in the agent home. Run `box login` to authenticate "
                     + "(persisted in the agent home).",
+            hard: false)
+    }
+
+    static func checkNetResolver(_ p: Probe) -> DiagnosticResult {
+        let ok = BoxNet.resolverFileCurrent(p.fileContents(BoxNet.resolverFile))
+        return DiagnosticResult(
+            name: "box .box resolver installed",
+            status: ok ? .pass : .warn,
+            detail: BoxNet.resolverFile,
+            remediation: ok
+                ? nil
+                : "Run `sudo box net init` once so running boxes resolve as `<box-id>.box`.",
             hard: false)
     }
 

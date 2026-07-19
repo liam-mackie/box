@@ -162,4 +162,27 @@ public enum Toolchains {
         }
         return lines.joined(separator: "\n") + "\n"
     }
+
+    public static func detected(fromFilenames filenames: [String]) -> [String] {
+        var ids = Set<String>()
+        for name in filenames {
+            let lower = name.lowercased()
+            if lower == "go.mod" {
+                ids.insert("go")
+            } else if lower == "cargo.toml" {
+                ids.insert("rust")
+            } else if lower == "global.json" || lower.hasSuffix(".csproj")
+                || lower.hasSuffix(".fsproj")
+            {
+                ids.insert("dotnet")
+            }
+        }
+        return ids.sorted()
+    }
+
+    public static func effective(configured: [String], origin: Origin, detected: [String])
+        -> [String]
+    {
+        origin == .default ? detected : configured
+    }
 }

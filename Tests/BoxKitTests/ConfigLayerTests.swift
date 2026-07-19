@@ -27,18 +27,23 @@ struct ConfigLayerTests {
         #expect(m.memory == "16g")  // falls back to global
     }
 
-    @Test("project value overrides only when key present (false != absent)")
-    func presentVsAbsent() {
-        // global sets mountClaudeConfig true; project does NOT set it -> stays true.
-        let m1 = Config.merge(
-            global: ConfigLayer(mountClaudeConfig: true),
+    @Test("mountClaudeConfig tri-state layers with provenance")
+    func mountClaudeConfigLayering() {
+        let globalOnly = Config.merged(
+            global: ConfigLayer(mountClaudeConfig: .ro),
             project: ConfigLayer())
-        #expect(m1.mountClaudeConfig == true)
-        // project explicitly sets it false -> overrides to false.
-        let m2 = Config.merge(
-            global: ConfigLayer(mountClaudeConfig: true),
-            project: ConfigLayer(mountClaudeConfig: false))
-        #expect(m2.mountClaudeConfig == false)
+        #expect(globalOnly.config.mountClaudeConfig == .ro)
+        #expect(globalOnly.origins.mountClaudeConfig == .global)
+
+        let projectWins = Config.merged(
+            global: ConfigLayer(mountClaudeConfig: .ro),
+            project: ConfigLayer(mountClaudeConfig: .rw))
+        #expect(projectWins.config.mountClaudeConfig == .rw)
+        #expect(projectWins.origins.mountClaudeConfig == .project)
+
+        let defaulted = Config.merged(global: ConfigLayer(), project: nil)
+        #expect(defaulted.config.mountClaudeConfig == .off)
+        #expect(defaulted.origins.mountClaudeConfig == .default)
     }
 
     @Test("extraMounts append, dedup by destination, project wins on collision")
@@ -68,42 +73,22 @@ struct ConfigLayerTests {
         #expect(m.origins.cpus == .global)
         #expect(m.origins.memory == .project)
         #expect(m.origins.rootfsSize == .default)
-        #expect(m.origins.tlsInspect == .default)
-        #expect(m.origins.bumpHosts == .default)
     }
 
-    @Test("tlsInspect/bumpHosts layer + merge with provenance")
-    func tlsInspectLayering() {
-        // Default: off / empty.
-        let d = Config.merge(global: ConfigLayer(), project: nil)
-        #expect(d.tlsInspect == false)
-        #expect(d.bumpHosts.isEmpty)
-
-        // global enables, project overrides bumpHosts only.
-        let global = ConfigLayer(tlsInspect: true, bumpHosts: ["g.internal"])
-        let project = ConfigLayer(bumpHosts: ["p.internal"])
-        let m = Config.merged(global: global, project: project)
-        #expect(m.config.tlsInspect == true)  // from global
-        #expect(m.config.bumpHosts == ["p.internal"])  // project wins
-        #expect(m.origins.tlsInspect == .global)
-        #expect(m.origins.bumpHosts == .project)
-    }
-
-    @Test("syncClaudeVersion/mountHooks layer + merge with provenance")
-    func syncAndHooksLayering() {
-        // Default: both on.
+    @Test("syncClaudeVersion layer + merge with provenance")
+    func syncLayering() {
+        // Default: on.
         let d = Config.merge(global: ConfigLayer(), project: nil)
         #expect(d.syncClaudeVersion == true)
-        #expect(d.mountHooks == true)
 
-        // global disables sync, project disables hooks.
+        // global disables sync, project disables skipPermissions.
         let global = ConfigLayer(syncClaudeVersion: false)
-        let project = ConfigLayer(mountHooks: false)
+        let project = ConfigLayer(skipPermissions: false)
         let m = Config.merged(global: global, project: project)
         #expect(m.config.syncClaudeVersion == false)
-        #expect(m.config.mountHooks == false)
+        #expect(m.config.skipPermissions == false)
         #expect(m.origins.syncClaudeVersion == .global)
-        #expect(m.origins.mountHooks == .project)
+        #expect(m.origins.skipPermissions == .project)
     }
 
     @Test("skipPermissions/disableTelemetry/clipboardSync layer + merge with provenance")
@@ -121,6 +106,17 @@ struct ConfigLayerTests {
         #expect(m.origins.skipPermissions == .global)
         #expect(m.origins.disableTelemetry == .default)
         #expect(m.origins.clipboardSync == .project)
+    }
+
+    @Test("dedicatedProxy default OFF, project layer overrides with provenance")
+    func dedicatedProxyLayering() {
+        let d = Config.merge(global: ConfigLayer(), project: nil)
+        #expect(d.dedicatedProxy == false)
+
+        let project = ConfigLayer(dedicatedProxy: true)
+        let m = Config.merged(global: ConfigLayer(), project: project)
+        #expect(m.config.dedicatedProxy == true)
+        #expect(m.origins.dedicatedProxy == .project)
     }
 
     // Regression: `envFile` is the only Optional config field, so the generic

@@ -1,5 +1,9 @@
 import Foundation
 
+public enum ClaudeConfigMount: String, Sendable, Codable, Equatable {
+    case off, ro, rw
+}
+
 /// User configuration, loaded from `$XDG_CONFIG_HOME/box/config.json`
 /// (default `~/.config/box/config.json`). A missing file — or missing keys —
 /// fall back to defaults, so partial configs are fine.
@@ -10,11 +14,7 @@ import Foundation
 /// resolved value is a `Config`; `MergedConfig` additionally carries per-value
 /// provenance so callers (e.g. `box config`) can report `[global]`/`[project]`/`[default]`.
 public struct Config: Sendable, Equatable {
-    /// Mount the host's `~/.claude` directory into the box so settings,
-    /// CLAUDE.md, commands, agents, etc. apply as they do on the host.
-    public var mountClaudeConfig: Bool
-    /// Mount `~/.claude` read-only (safer, but Claude can't persist state there).
-    public var claudeConfigReadOnly: Bool
+    public var mountClaudeConfig: ClaudeConfigMount
     /// Additional host directories to expose in the box.
     public var extraMounts: [ExtraMount]
     /// Virtual CPUs assigned to the microVM.
@@ -31,21 +31,10 @@ public struct Config: Sendable, Equatable {
     public var toolchains: [String]
     /// Host directories exposed as broad read-only roots under `/mnt`.
     public var readOnlyRoots: [String]
-    /// Opt-in TLS inspection (MITM): mount the `box ca init` CA into the guest and
-    /// let squid forge leaf certs for `bumpHosts`. OFF by default. Everything not
-    /// in `bumpHosts` is still only peeked-and-spliced (SNI), never decrypted.
-    public var tlsInspect: Bool
-    /// Hosts squid is allowed to MITM-bump (decrypt) when `tlsInspect` is on. Only
-    /// these are bumped; everything else — especially the Anthropic/Claude API,
-    /// npm, and git — is spliced so cert-pinned / auth-sensitive clients keep working.
-    public var bumpHosts: [String]
     /// Keep the image's baked claude-code at least as new as the host's `claude`.
     /// Checked at launch; a stale image triggers a fast CLAUDE_VERSION-layer
     /// rebuild (best-effort — no docker ⇒ warn and run the existing image).
     public var syncClaudeVersion: Bool
-    /// Mount (read-only) the host files that hook commands in Claude settings
-    /// reference, so hooks configured on the host also run inside the box.
-    public var mountHooks: Bool
     /// Launch claude with `--dangerously-skip-permissions`. Defaults ON: the
     /// microVM + egress allowlist is box's permission boundary, so per-tool
     /// prompts inside it are friction without isolation value. `box run` only —
@@ -60,11 +49,14 @@ public struct Config: Sendable, Equatable {
     /// run) so pasting an image into Claude works. Images only — text (which is
     /// where passwords live) is never synced.
     public var clipboardSync: Bool
+    /// Give this box its OWN dedicated Envoy egress sidecar VM instead of sharing
+    /// the daemon-owned one (stronger isolation, higher cost). Default false —
+    /// boxes share one sidecar.
+    public var dedicatedProxy: Bool
 
     // Defaults, kept in one place so both `init` and the tolerant decoders agree.
     public enum Defaults {
-        public static let mountClaudeConfig = false
-        public static let claudeConfigReadOnly = false
+        public static let mountClaudeConfig = ClaudeConfigMount.off
         public static let extraMounts: [ExtraMount] = []
         public static let cpus = 4
         public static let memory = "4g"
@@ -73,13 +65,11 @@ public struct Config: Sendable, Equatable {
         public static let envFile: String? = nil
         public static let toolchains: [String] = []
         public static let readOnlyRoots: [String] = []
-        public static let tlsInspect = false
-        public static let bumpHosts: [String] = []
         public static let syncClaudeVersion = true
-        public static let mountHooks = true
         public static let skipPermissions = true
         public static let disableTelemetry = true
         public static let clipboardSync = true
+        public static let dedicatedProxy = false
     }
 
     public struct ExtraMount: Sendable, Equatable {
@@ -95,8 +85,7 @@ public struct Config: Sendable, Equatable {
     }
 
     public init(
-        mountClaudeConfig: Bool = Defaults.mountClaudeConfig,
-        claudeConfigReadOnly: Bool = Defaults.claudeConfigReadOnly,
+        mountClaudeConfig: ClaudeConfigMount = Defaults.mountClaudeConfig,
         extraMounts: [ExtraMount] = Defaults.extraMounts,
         cpus: Int = Defaults.cpus,
         memory: String = Defaults.memory,
@@ -105,16 +94,13 @@ public struct Config: Sendable, Equatable {
         envFile: String? = Defaults.envFile,
         toolchains: [String] = Defaults.toolchains,
         readOnlyRoots: [String] = Defaults.readOnlyRoots,
-        tlsInspect: Bool = Defaults.tlsInspect,
-        bumpHosts: [String] = Defaults.bumpHosts,
         syncClaudeVersion: Bool = Defaults.syncClaudeVersion,
-        mountHooks: Bool = Defaults.mountHooks,
         skipPermissions: Bool = Defaults.skipPermissions,
         disableTelemetry: Bool = Defaults.disableTelemetry,
-        clipboardSync: Bool = Defaults.clipboardSync
+        clipboardSync: Bool = Defaults.clipboardSync,
+        dedicatedProxy: Bool = Defaults.dedicatedProxy
     ) {
         self.mountClaudeConfig = mountClaudeConfig
-        self.claudeConfigReadOnly = claudeConfigReadOnly
         self.extraMounts = extraMounts
         self.cpus = cpus
         self.memory = memory
@@ -123,13 +109,11 @@ public struct Config: Sendable, Equatable {
         self.envFile = envFile
         self.toolchains = toolchains
         self.readOnlyRoots = readOnlyRoots
-        self.tlsInspect = tlsInspect
-        self.bumpHosts = bumpHosts
         self.syncClaudeVersion = syncClaudeVersion
-        self.mountHooks = mountHooks
         self.skipPermissions = skipPermissions
         self.disableTelemetry = disableTelemetry
         self.clipboardSync = clipboardSync
+        self.dedicatedProxy = dedicatedProxy
     }
 
     /// Location of the global config file (honors XDG_CONFIG_HOME).
@@ -211,12 +195,12 @@ public struct Config: Sendable, Equatable {
     /// caller so this stays filesystem-free and unit-testable.
     public func resolvedMounts(claudeDir: String, claudeExists: Bool) -> [MountSpec] {
         var specs: [MountSpec] = []
-        if mountClaudeConfig && claudeExists {
+        if mountClaudeConfig != .off && claudeExists {
             specs.append(
                 MountSpec(
                     source: claudeDir,
                     destination: "/home/agent/.claude",
-                    readOnly: claudeConfigReadOnly))
+                    readOnly: mountClaudeConfig == .ro))
         }
         for m in extraMounts {
             specs.append(
@@ -239,24 +223,38 @@ public struct Config: Sendable, Equatable {
             return Config()
         }
     }
+
+    static let starterJSON = """
+        {
+          "mountClaudeConfig": "ro"
+        }
+        """
+
+    @discardableResult
+    public static func writeStarter() throws -> Bool {
+        let url = fileURL
+        if FileManager.default.fileExists(atPath: url.path) { return false }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data((starterJSON + "\n").utf8).write(to: url, options: [.withoutOverwriting])
+        return true
+    }
 }
 
 // Decoding tolerates missing keys (each falls back to its default).
 extension Config: Decodable {
-    enum CodingKeys: String, CodingKey {
-        case mountClaudeConfig, claudeConfigReadOnly, extraMounts
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case mountClaudeConfig, extraMounts
         case cpus, memory, rootfsSize, env, envFile, toolchains, readOnlyRoots
-        case tlsInspect, bumpHosts, syncClaudeVersion, mountHooks
-        case skipPermissions, disableTelemetry, clipboardSync
+        case syncClaudeVersion
+        case skipPermissions, disableTelemetry, clipboardSync, dedicatedProxy
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
-            mountClaudeConfig: try c.decodeIfPresent(Bool.self, forKey: .mountClaudeConfig)
+            mountClaudeConfig: try c.decodeIfPresent(ClaudeConfigMount.self, forKey: .mountClaudeConfig)
                 ?? Defaults.mountClaudeConfig,
-            claudeConfigReadOnly: try c.decodeIfPresent(Bool.self, forKey: .claudeConfigReadOnly)
-                ?? Defaults.claudeConfigReadOnly,
             extraMounts: try c.decodeIfPresent([ExtraMount].self, forKey: .extraMounts)
                 ?? Defaults.extraMounts,
             cpus: try c.decodeIfPresent(Int.self, forKey: .cpus) ?? Defaults.cpus,
@@ -269,20 +267,16 @@ extension Config: Decodable {
                 ?? Defaults.toolchains,
             readOnlyRoots: try c.decodeIfPresent([String].self, forKey: .readOnlyRoots)
                 ?? Defaults.readOnlyRoots,
-            tlsInspect: try c.decodeIfPresent(Bool.self, forKey: .tlsInspect)
-                ?? Defaults.tlsInspect,
-            bumpHosts: try c.decodeIfPresent([String].self, forKey: .bumpHosts)
-                ?? Defaults.bumpHosts,
             syncClaudeVersion: try c.decodeIfPresent(Bool.self, forKey: .syncClaudeVersion)
                 ?? Defaults.syncClaudeVersion,
-            mountHooks: try c.decodeIfPresent(Bool.self, forKey: .mountHooks)
-                ?? Defaults.mountHooks,
             skipPermissions: try c.decodeIfPresent(Bool.self, forKey: .skipPermissions)
                 ?? Defaults.skipPermissions,
             disableTelemetry: try c.decodeIfPresent(Bool.self, forKey: .disableTelemetry)
                 ?? Defaults.disableTelemetry,
             clipboardSync: try c.decodeIfPresent(Bool.self, forKey: .clipboardSync)
-                ?? Defaults.clipboardSync
+                ?? Defaults.clipboardSync,
+            dedicatedProxy: try c.decodeIfPresent(Bool.self, forKey: .dedicatedProxy)
+                ?? Defaults.dedicatedProxy
         )
     }
 }
@@ -306,8 +300,7 @@ extension Config.ExtraMount: Decodable {
 /// from "key set to its default". Decoded tolerantly from a config file; the
 /// nil-for-everything case is a valid (empty) layer.
 public struct ConfigLayer: Sendable, Equatable {
-    public var mountClaudeConfig: Bool?
-    public var claudeConfigReadOnly: Bool?
+    public var mountClaudeConfig: ClaudeConfigMount?
     public var extraMounts: [Config.ExtraMount]?
     public var cpus: Int?
     public var memory: String?
@@ -316,17 +309,14 @@ public struct ConfigLayer: Sendable, Equatable {
     public var envFile: String?
     public var toolchains: [String]?
     public var readOnlyRoots: [String]?
-    public var tlsInspect: Bool?
-    public var bumpHosts: [String]?
     public var syncClaudeVersion: Bool?
-    public var mountHooks: Bool?
     public var skipPermissions: Bool?
     public var disableTelemetry: Bool?
     public var clipboardSync: Bool?
+    public var dedicatedProxy: Bool?
 
     public init(
-        mountClaudeConfig: Bool? = nil,
-        claudeConfigReadOnly: Bool? = nil,
+        mountClaudeConfig: ClaudeConfigMount? = nil,
         extraMounts: [Config.ExtraMount]? = nil,
         cpus: Int? = nil,
         memory: String? = nil,
@@ -335,16 +325,13 @@ public struct ConfigLayer: Sendable, Equatable {
         envFile: String? = nil,
         toolchains: [String]? = nil,
         readOnlyRoots: [String]? = nil,
-        tlsInspect: Bool? = nil,
-        bumpHosts: [String]? = nil,
         syncClaudeVersion: Bool? = nil,
-        mountHooks: Bool? = nil,
         skipPermissions: Bool? = nil,
         disableTelemetry: Bool? = nil,
-        clipboardSync: Bool? = nil
+        clipboardSync: Bool? = nil,
+        dedicatedProxy: Bool? = nil
     ) {
         self.mountClaudeConfig = mountClaudeConfig
-        self.claudeConfigReadOnly = claudeConfigReadOnly
         self.extraMounts = extraMounts
         self.cpus = cpus
         self.memory = memory
@@ -353,13 +340,11 @@ public struct ConfigLayer: Sendable, Equatable {
         self.envFile = envFile
         self.toolchains = toolchains
         self.readOnlyRoots = readOnlyRoots
-        self.tlsInspect = tlsInspect
-        self.bumpHosts = bumpHosts
         self.syncClaudeVersion = syncClaudeVersion
-        self.mountHooks = mountHooks
         self.skipPermissions = skipPermissions
         self.disableTelemetry = disableTelemetry
         self.clipboardSync = clipboardSync
+        self.dedicatedProxy = dedicatedProxy
     }
 
     /// Decode a layer from JSON, returning an empty layer (all nil) on absence
@@ -378,17 +363,16 @@ public struct ConfigLayer: Sendable, Equatable {
 
 extension ConfigLayer: Decodable {
     enum CodingKeys: String, CodingKey {
-        case mountClaudeConfig, claudeConfigReadOnly, extraMounts
+        case mountClaudeConfig, extraMounts
         case cpus, memory, rootfsSize, env, envFile, toolchains, readOnlyRoots
-        case tlsInspect, bumpHosts, syncClaudeVersion, mountHooks
-        case skipPermissions, disableTelemetry, clipboardSync
+        case syncClaudeVersion
+        case skipPermissions, disableTelemetry, clipboardSync, dedicatedProxy
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
-            mountClaudeConfig: try c.decodeIfPresent(Bool.self, forKey: .mountClaudeConfig),
-            claudeConfigReadOnly: try c.decodeIfPresent(Bool.self, forKey: .claudeConfigReadOnly),
+            mountClaudeConfig: try c.decodeIfPresent(ClaudeConfigMount.self, forKey: .mountClaudeConfig),
             extraMounts: try c.decodeIfPresent([Config.ExtraMount].self, forKey: .extraMounts),
             cpus: try c.decodeIfPresent(Int.self, forKey: .cpus),
             memory: try c.decodeIfPresent(String.self, forKey: .memory),
@@ -397,13 +381,11 @@ extension ConfigLayer: Decodable {
             envFile: try c.decodeIfPresent(String.self, forKey: .envFile),
             toolchains: try c.decodeIfPresent([String].self, forKey: .toolchains),
             readOnlyRoots: try c.decodeIfPresent([String].self, forKey: .readOnlyRoots),
-            tlsInspect: try c.decodeIfPresent(Bool.self, forKey: .tlsInspect),
-            bumpHosts: try c.decodeIfPresent([String].self, forKey: .bumpHosts),
             syncClaudeVersion: try c.decodeIfPresent(Bool.self, forKey: .syncClaudeVersion),
-            mountHooks: try c.decodeIfPresent(Bool.self, forKey: .mountHooks),
             skipPermissions: try c.decodeIfPresent(Bool.self, forKey: .skipPermissions),
             disableTelemetry: try c.decodeIfPresent(Bool.self, forKey: .disableTelemetry),
-            clipboardSync: try c.decodeIfPresent(Bool.self, forKey: .clipboardSync)
+            clipboardSync: try c.decodeIfPresent(Bool.self, forKey: .clipboardSync),
+            dedicatedProxy: try c.decodeIfPresent(Bool.self, forKey: .dedicatedProxy)
         )
     }
 }
@@ -439,8 +421,6 @@ extension Config {
 
         let (mountClaude, mountClaudeOrigin) =
             pick(p.mountClaudeConfig, global.mountClaudeConfig, Defaults.mountClaudeConfig)
-        let (claudeRO, claudeROOrigin) =
-            pick(p.claudeConfigReadOnly, global.claudeConfigReadOnly, Defaults.claudeConfigReadOnly)
         let (cpus, cpusOrigin) = pick(p.cpus, global.cpus, Defaults.cpus)
         let (memory, memoryOrigin) = pick(p.memory, global.memory, Defaults.memory)
         let (rootfsSize, rootfsOrigin) = pick(p.rootfsSize, global.rootfsSize, Defaults.rootfsSize)
@@ -462,19 +442,16 @@ extension Config {
             p.toolchains, global.toolchains, Defaults.toolchains)
         let (roRoots, roRootsOrigin) = pick(
             p.readOnlyRoots, global.readOnlyRoots, Defaults.readOnlyRoots)
-        let (tlsInspect, tlsInspectOrigin) = pick(
-            p.tlsInspect, global.tlsInspect, Defaults.tlsInspect)
-        let (bumpHosts, bumpHostsOrigin) = pick(p.bumpHosts, global.bumpHosts, Defaults.bumpHosts)
         let (syncClaude, syncClaudeOrigin) =
             pick(p.syncClaudeVersion, global.syncClaudeVersion, Defaults.syncClaudeVersion)
-        let (mountHooks, mountHooksOrigin) =
-            pick(p.mountHooks, global.mountHooks, Defaults.mountHooks)
         let (skipPermissions, skipPermissionsOrigin) =
             pick(p.skipPermissions, global.skipPermissions, Defaults.skipPermissions)
         let (disableTelemetry, disableTelemetryOrigin) =
             pick(p.disableTelemetry, global.disableTelemetry, Defaults.disableTelemetry)
         let (clipboardSync, clipboardSyncOrigin) =
             pick(p.clipboardSync, global.clipboardSync, Defaults.clipboardSync)
+        let (dedicatedProxy, dedicatedProxyOrigin) =
+            pick(p.dedicatedProxy, global.dedicatedProxy, Defaults.dedicatedProxy)
 
         // extraMounts: append global then project, dedup by destination (project wins).
         let (mounts, mountsOrigin) = mergeExtraMounts(
@@ -482,7 +459,6 @@ extension Config {
 
         let config = Config(
             mountClaudeConfig: mountClaude,
-            claudeConfigReadOnly: claudeRO,
             extraMounts: mounts,
             cpus: cpus,
             memory: memory,
@@ -491,17 +467,14 @@ extension Config {
             envFile: envFile,
             toolchains: toolchains,
             readOnlyRoots: roRoots,
-            tlsInspect: tlsInspect,
-            bumpHosts: bumpHosts,
             syncClaudeVersion: syncClaude,
-            mountHooks: mountHooks,
             skipPermissions: skipPermissions,
             disableTelemetry: disableTelemetry,
-            clipboardSync: clipboardSync
+            clipboardSync: clipboardSync,
+            dedicatedProxy: dedicatedProxy
         )
         let origins = MergedConfig.Origins(
             mountClaudeConfig: mountClaudeOrigin,
-            claudeConfigReadOnly: claudeROOrigin,
             extraMounts: mountsOrigin,
             cpus: cpusOrigin,
             memory: memoryOrigin,
@@ -510,13 +483,11 @@ extension Config {
             envFile: envFileOrigin,
             toolchains: toolchainsOrigin,
             readOnlyRoots: roRootsOrigin,
-            tlsInspect: tlsInspectOrigin,
-            bumpHosts: bumpHostsOrigin,
             syncClaudeVersion: syncClaudeOrigin,
-            mountHooks: mountHooksOrigin,
             skipPermissions: skipPermissionsOrigin,
             disableTelemetry: disableTelemetryOrigin,
-            clipboardSync: clipboardSyncOrigin
+            clipboardSync: clipboardSyncOrigin,
+            dedicatedProxy: dedicatedProxyOrigin
         )
         return MergedConfig(config: config, origins: origins)
     }
@@ -552,7 +523,6 @@ public struct MergedConfig: Sendable, Equatable {
 
     public struct Origins: Sendable, Equatable {
         public var mountClaudeConfig: Origin
-        public var claudeConfigReadOnly: Origin
         public var extraMounts: Origin
         public var cpus: Origin
         public var memory: Origin
@@ -561,24 +531,21 @@ public struct MergedConfig: Sendable, Equatable {
         public var envFile: Origin
         public var toolchains: Origin
         public var readOnlyRoots: Origin
-        public var tlsInspect: Origin
-        public var bumpHosts: Origin
         public var syncClaudeVersion: Origin
-        public var mountHooks: Origin
         public var skipPermissions: Origin
         public var disableTelemetry: Origin
         public var clipboardSync: Origin
+        public var dedicatedProxy: Origin
 
         public init(
-            mountClaudeConfig: Origin, claudeConfigReadOnly: Origin, extraMounts: Origin,
+            mountClaudeConfig: Origin, extraMounts: Origin,
             cpus: Origin, memory: Origin, rootfsSize: Origin, env: Origin,
             envFile: Origin, toolchains: Origin, readOnlyRoots: Origin,
-            tlsInspect: Origin, bumpHosts: Origin,
-            syncClaudeVersion: Origin, mountHooks: Origin,
-            skipPermissions: Origin, disableTelemetry: Origin, clipboardSync: Origin
+            syncClaudeVersion: Origin,
+            skipPermissions: Origin, disableTelemetry: Origin, clipboardSync: Origin,
+            dedicatedProxy: Origin
         ) {
             self.mountClaudeConfig = mountClaudeConfig
-            self.claudeConfigReadOnly = claudeConfigReadOnly
             self.extraMounts = extraMounts
             self.cpus = cpus
             self.memory = memory
@@ -587,13 +554,11 @@ public struct MergedConfig: Sendable, Equatable {
             self.envFile = envFile
             self.toolchains = toolchains
             self.readOnlyRoots = readOnlyRoots
-            self.tlsInspect = tlsInspect
-            self.bumpHosts = bumpHosts
             self.syncClaudeVersion = syncClaudeVersion
-            self.mountHooks = mountHooks
             self.skipPermissions = skipPermissions
             self.disableTelemetry = disableTelemetry
             self.clipboardSync = clipboardSync
+            self.dedicatedProxy = dedicatedProxy
         }
     }
 

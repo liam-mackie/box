@@ -5,3 +5,8 @@
 .DS_Store
 # generated shell completion scripts (`make completions`)
 /completions/
+# Rust build products (box-proxy crate)
+/proxy/target/
+# generated CA fixtures (never commit private keys)
+/proxy/tests/fixtures/ca.crt
+/proxy/tests/fixtures/ca.key
