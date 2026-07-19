@@ -282,33 +282,6 @@ public enum SecretTemplate {
         return hasValue ? [] : ["template must contain \"${value}\""]
     }
 
-    /// Render a template with a resolved value, applying each token's transforms.
-    public static func render(_ template: String, value: String) throws -> String {
-        var out = ""
-        for piece in try parse(template) {
-            switch piece {
-            case .literal(let s): out += s
-            case .value(let transforms):
-                var v = value
-                for t in transforms { v = try applyTransform(t, to: v) }
-                out += v
-            }
-        }
-        return out
-    }
-
-    private static func applyTransform(_ name: String, to value: String) throws -> String {
-        switch name {
-        case "base64":
-            return Data(value.utf8).base64EncodedString()
-        case "urlencode":
-            let allowed = CharacterSet(charactersIn:
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-            return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-        default:
-            throw CBError("unknown transform \"\(name)\"")
-        }
-    }
 }
 
 // MARK: - Registry store (thin FS wrapper)

@@ -19,8 +19,6 @@ struct SecretInjectionTests {
         SecretInjection.Resolved(requirement: r, value: value)
     }
 
-    // MARK: merge / partition
-
     @Test("effectiveRequirements: global wins on name clash")
     func globalWins() {
         let g = [req("A", scopes: [SecretScope(host: "g.example.com")])]
@@ -54,14 +52,6 @@ struct SecretInjectionTests {
         #expect(unmet == ["E"])
     }
 
-    @Test("bumpHosts dedupes across scopes")
-    func bumpHostsDedup() {
-        let r = resolved(
-            req("A", scopes: [SecretScope(host: "x.example.com"), SecretScope(host: "x.example.com")]),
-            "t")
-        #expect(SecretInjection.bumpHosts([r]) == ["x.example.com"])
-    }
-
     @Test("renderHudsuckerConfig emits value + injection + scopes as JSON")
     func hudsuckerConfig() throws {
         let r = resolved(
@@ -91,91 +81,12 @@ struct SecretInjectionTests {
         #expect(doc.secrets.isEmpty)
     }
 
-    // MARK: header/cookie ACL
-
-    @Test("header rule: strip + add with path regex, quote-escaped")
-    func headerACL() throws {
+    @Test("bootSummary lists name, location, and hosts (never the value)")
+    func bootSummary() {
         let r = resolved(
-            req("GH", scopes: [SecretScope(host: "api.example.com", pathPrefix: "/v1/")]),
-            "TOK\"EN")
-        let acl = try SecretInjection.renderHeaderCookieACL([r])
-        #expect(acl.contains("acl sec_GH_0_host dstdomain api.example.com"))
-        #expect(acl.contains("acl sec_GH_0_path urlpath_regex ^/v1/"))
-        #expect(acl.contains("request_header_access Authorization deny sec_GH_0_host"))
-        #expect(acl.contains(#"request_header_add Authorization "Bearer TOK\"EN" sec_GH_0_host sec_GH_0_path"#))
-    }
-
-    @Test("cookie location injects the Cookie header")
-    func cookieACL() throws {
-        let r = resolved(
-            req("S", location: .cookie, field: "session", template: "${value}",
-                scopes: [SecretScope(host: "app.example.com")]),
-            "abc")
-        let acl = try SecretInjection.renderHeaderCookieACL([r])
-        #expect(acl.contains("request_header_access Cookie deny sec_S_0_host"))
-        #expect(acl.contains(#"request_header_add Cookie "abc" sec_S_0_host"#))
-        // No path constraint ⇒ no _path acl in the add line.
-        #expect(!acl.contains("sec_S_0_path"))
-    }
-
-    @Test("hyphenated name becomes a safe ACL identifier")
-    func aclSafeName() throws {
-        let r = resolved(req("gh-api", scopes: [SecretScope(host: "h")]), "t")
-        let acl = try SecretInjection.renderHeaderCookieACL([r])
-        #expect(acl.contains("acl sec_gh_api_0_host"))
-    }
-
-    @Test("a value with a newline is refused (header-injection guard)")
-    func rejectsNewline() {
-        let r = resolved(req("N", scopes: [SecretScope(host: "h")]), "bad\nvalue")
-        #expect(throws: (any Error).self) {
-            _ = try SecretInjection.renderHeaderCookieACL([r])
-        }
-    }
-
-    @Test("query secrets are excluded from the header ACL")
-    func queryNotInHeaderACL() throws {
-        let r = resolved(
-            req("Q", location: .query, field: "api_key", template: "${value}",
-                scopes: [SecretScope(host: "h")]),
-            "k")
-        #expect(try SecretInjection.renderHeaderCookieACL([r]).isEmpty)
-    }
-
-    // MARK: query config
-
-    @Test("query config is tab-separated with * for no path")
-    func queryConfig() throws {
-        let r = resolved(
-            req("Q", location: .query, field: "api_key", template: "${value|urlencode}",
-                scopes: [SecretScope(host: "api.example.com")]),
-            "a b")
-        let conf = try SecretInjection.renderQueryConfig([r])
-        #expect(conf == "api.example.com\t*\tapi_key\ta%20b\n")
-        #expect(SecretInjection.hasQuery([r]))
-    }
-
-    @Test("query config uses ^prefix regex when a path is set")
-    func queryConfigPath() throws {
-        let r = resolved(
-            req("Q", location: .query, field: "k", template: "${value}",
-                scopes: [SecretScope(host: "h", pathPrefix: "/api/")]),
-            "v")
-        let conf = try SecretInjection.renderQueryConfig([r])
-        #expect(conf == "h\t^/api/\tk\tv\n")
-    }
-
-    // MARK: manifest
-
-    @Test("manifest lists scope + source but never the value")
-    func manifest() {
-        let r = resolved(
-            req("GH", scopes: [SecretScope(host: "api.example.com", pathPrefix: "/v1/")]),
-            "SECRET-TOKEN")
-        let json = SecretInjection.renderManifest([r]) { _ in "env:GH_TOKEN" }
-        #expect(json.contains("\"GH\""))
-        #expect(json.contains("api.example.com"))
-        #expect(json.contains("env:GH_TOKEN"))
-        #expect(!json.contains("SECRET-TOKEN"))
+            req("GH", scopes: [SecretScope(host: "api.github.com")]), "SECRET-TOKEN")
+        let summary = SecretInjection.bootSummary([r])
+        #expect(summary == "GH(header→api.github.com)")
+        #expect(!summary.contains("SECRET-TOKEN"))
     }
 }

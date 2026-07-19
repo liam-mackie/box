@@ -121,19 +121,18 @@ struct SecretStoreTests {
         #expect(file.requirements[0].injection.location == .cookie)
     }
 
-    // MARK: template rendering
+    // MARK: template validation
 
-    @Test("template renders literal + base64 + urlencode")
-    func templateRender() throws {
-        #expect(try SecretTemplate.render("Bearer ${value}", value: "T") == "Bearer T")
-        #expect(try SecretTemplate.render("${value|base64}", value: "abc") == "YWJj")
-        #expect(try SecretTemplate.render("${value|urlencode}", value: "a b/c") == "a%20b%2Fc")
+    @Test("template validation accepts value tokens and known transforms")
+    func templateValid() {
+        #expect(SecretTemplate.validationErrors("Bearer ${value}").isEmpty)
+        #expect(SecretTemplate.validationErrors("${value|base64}").isEmpty)
+        #expect(SecretTemplate.validationErrors("${value|urlencode}").isEmpty)
     }
 
-    @Test("unknown transform throws at render")
-    func renderThrowsUnknown() {
-        #expect(throws: (any Error).self) {
-            _ = try SecretTemplate.render("${value|nope}", value: "x")
-        }
+    @Test("template validation rejects a missing value token and unknown transforms")
+    func templateInvalid() {
+        #expect(!SecretTemplate.validationErrors("no token here").isEmpty)
+        #expect(!SecretTemplate.validationErrors("${value|nope}").isEmpty)
     }
 }
