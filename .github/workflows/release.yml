@@ -70,25 +70,22 @@ jobs:
 
       - name: Notarize and staple
         env:
-          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG="dist/box-$GITHUB_REF_NAME-macos-arm64.dmg"
-          KEY_PATH="$RUNNER_TEMP/notary-key.p8"
-          printf '%s' "$APPLE_NOTARY_KEY" > "$KEY_PATH"
           SUBMISSION="$(xcrun notarytool submit "$DMG" \
-            --key "$KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" \
             --wait --timeout 30m --output-format json)"
           echo "$SUBMISSION"
           STATUS="$(jq -r .status <<< "$SUBMISSION")"
           if [ "$STATUS" != "Accepted" ]; then
             SUBMISSION_ID="$(jq -r .id <<< "$SUBMISSION")"
             xcrun notarytool log "$SUBMISSION_ID" \
-              --key "$KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
             exit 1
           fi
-          rm "$KEY_PATH"
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
           spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
