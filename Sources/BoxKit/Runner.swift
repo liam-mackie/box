@@ -228,7 +228,7 @@ enum Runner {
             RunState.remove(id: id)
             for dir in [
                 ClipboardSync.hostDir(forBoxID: id),
-                ManagedSettings.hostDir(forBoxID: id),
+                ClaudeSettings.hostDir(forBoxID: id),
                 Box.secretDir(forBoxID: id),
                 projectAllowlistStagingDir(id: id),
                 caSidecarStagingDir(id: id),
@@ -416,7 +416,7 @@ enum Runner {
         m.append(.share(source: agentHome, destination: "/home/agent"))
         m.append(.share(source: configDir, destination: "/etc/box", options: ["ro"]))
         m += userMounts(cfg)
-        m += ManagedSettings.mounts(cfg, id: id)
+        m += ClaudeSettings.mounts(cfg, id: id)
         m += readOnlyRootMounts(cfg)
         m += envMounts(
             cfg, id: id, exports: SecretInjection.placeholderExports(secretPlan.resolved))

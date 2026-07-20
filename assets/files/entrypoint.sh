@@ -242,22 +242,11 @@ iptables -A OUTPUT -p tcp -d "${PROXY_HOST}" --dport "${PROXY_TCP_PORT}" -j ACCE
 apply_local_egress
 # Everything else is dropped: the agent's only route out is the sidecar proxy.
 
-# ── Claude Code managed settings (host-staged → guest rootfs) ───────────────
-# The host stages `managed-settings.json` (disableAllHooks + no-op statusline —
-# see ManagedSettings.swift) into this read-only share. We COPY it onto the real
-# rootfs at the path Claude Code reads managed policy from on Linux, root-owned,
-# rather than mounting the share there directly: a virtiofs file arrives owned by
-# the AGENT's uid (the host user maps to uid 501), and a policy file owned by the
-# very user it constrains isn't trustworthy — Claude Code ignores it in exactly
-# that setup. Root-owned on ext4, it behaves like the enterprise-managed file it
-# is impersonating. The share is then unmounted (the copy is the real thing).
-MANAGED_MOUNT=/run/box-managed
-MANAGED_DST=/etc/claude-code/managed-settings.json
-if [ -f "$MANAGED_MOUNT/managed-settings.json" ]; then
-    mkdir -p "$(dirname "$MANAGED_DST")"
-    install -m 0644 "$MANAGED_MOUNT/managed-settings.json" "$MANAGED_DST"
-    umount -l "$MANAGED_MOUNT" 2>/dev/null || true
-    echo "[box] host claude hooks/statusline disabled in the guest (managed settings)."
+CLAUDE_SETTINGS_SRC=/run/box-claude-settings/settings.json
+CLAUDE_SETTINGS_DST=/home/agent/.claude/settings.json
+if [ -f "$CLAUDE_SETTINGS_SRC" ] && [ -f "$CLAUDE_SETTINGS_DST" ]; then
+    mount --bind -o ro "$CLAUDE_SETTINGS_SRC" "$CLAUDE_SETTINGS_DST" \
+        && echo "[box] host claude hooks/statusline stripped from the mounted config."
 fi
 
 # Dynamic filesystem visibility: build the agent's /mnt/<basename> views from the

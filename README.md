@@ -264,7 +264,7 @@ defaults. `box config` prints the resolved values.
 
 | Key | Default | Effect |
 |---|---|---|
-| `mountClaudeConfig` | `"off"` | `"off"` \| `"ro"` \| `"rw"` — mount the host `~/.claude` at `/home/agent/.claude` (read-only or writable), so your settings, `CLAUDE.md`, commands, agents, etc. apply inside the box. The code default is `off`, but the seeded starter config sets `ro`. Host `hooks` and `statusLine` are automatically disabled **inside the box** (via a guest-only Claude managed-settings file): they invoke host binaries/paths absent from the Linux VM, so they'd only fail. Pure JSON config (model, theme, permissions, …) applies normally. |
+| `mountClaudeConfig` | `"off"` | `"off"` \| `"ro"` \| `"rw"` — mount the host `~/.claude` at `/home/agent/.claude` (read-only or writable), so your settings, `CLAUDE.md`, commands, agents, etc. apply inside the box. The code default is `off`, but the seeded starter config sets `ro`. The host `hooks` and `statusLine` keys are stripped from the copy of `settings.json` the box sees: they invoke host binaries/paths absent from the Linux VM, so they'd only fail. Pure JSON config (model, theme, permissions, …) applies normally. |
 | `toolchains` | *(detect)* | Override toolchain auto-detection (`"dotnet"`, `"go"`, `"rust"`). Key absent → detect from project markers; explicit list wins; `[]` disables. |
 | `syncClaudeVersion` | `true` | At launch, compare the image's baked claude-code to the host's `claude --version` and, when the image is older, rebuild the Claude layer pinned to the host version before booting. Any failure warns and runs the existing image. |
 | `skipPermissions` | `true` | Launch claude with `--dangerously-skip-permissions`. The microVM + egress allowlist is box's permission boundary, so per-tool prompts inside it add friction without isolation. Your own permission flags always win; `box login` is unaffected. |
@@ -278,9 +278,11 @@ defaults. `box config` prints the resolved values.
 
 > [!WARNING]
 > Mounting `~/.claude` **writable** (`"rw"`) lets the sandboxed agent modify
-> your real Claude config, including writing hooks into `settings.json` that
-> execute on the **host** later. That is a path out of the sandbox — prefer
-> `"ro"` (what the starter config seeds). Read-only means Claude can't persist
+> your real Claude config — a path out of the sandbox — so prefer `"ro"` (what
+> the starter config seeds). `settings.json` is always bind-mounted read-only
+> from a sanitized copy, so the agent can never write hooks back into it even
+> under `"rw"`; the rest of `~/.claude` stays writable in that mode. Read-only
+> (`"ro"`) means Claude can't persist
 > session state back to `~/.claude`; with `"rw"`, the box's login also persists
 > into `~/.claude` rather than the isolated `~/.box/agent-home`.
 >
@@ -300,7 +302,7 @@ Sources/BoxKit/        library (logic; importable by tests)
   Runner.swift         boots the VM via ContainerManager; mounts, caps, DNS, TTY
   ImageBridge.swift    container build → OCI → ImageStore.load (docker fallback);
                        launch-time claude-code version sync
-  ManagedSettings.swift guest-only managed-settings.json (disables host hooks/statusline)
+  ClaudeSettings.swift strips host hooks/statusLine from the mounted settings.json
   Daemon.swift         `box system`: owns the shared box-proxy sidecar + vmnet network,
                        leases addresses to boxes over a unix socket (required service)
   DaemonClient.swift   client side of the daemon protocol (lease/release/status/stop/start)
@@ -355,6 +357,16 @@ assets/files/
   `devcontainer.json` (fail-closed; any edit re-blocks). Detection alone never
   builds; `--devcontainer` is explicit per-run consent; `--allowlist-only`
   never approves it.
+- **Host hooks are stripped, not disabled.** With `~/.claude` mounted, the host
+  `settings.json` carries `hooks`/`statusLine` that point at macOS binaries and
+  paths absent from the Linux VM. box parses that file host-side, drops those
+  two keys, and bind-mounts the sanitized copy read-only over
+  `/home/agent/.claude/settings.json` in the guest — a per-run staging dir
+  carries the one file, since the framework shares whole directories, not single
+  files. A managed-settings `disableAllHooks` overlay was tried first, but
+  enterprise server-managed settings (`~/.claude/remote-settings.json`) occupy
+  the same top precedence tier and override it, so stripping at the source is the
+  only reliable neutralizer.
 
 Mapping to the framework (replacing the old `container run` flags):
 
