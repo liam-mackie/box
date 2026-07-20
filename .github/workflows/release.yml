@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, sign, notarize, publish
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select latest Xcode 26
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -n 1)"
+          swift --version
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: swiftpm-release-${{ hashFiles('Package.resolved') }}
+          restore-keys: swiftpm-release-
+
+      - name: Build and generate completions
+        run: make completions
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$IDENTITY"
+          echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Sign binary
+        run: |
+          codesign --force --options runtime --timestamp \
+            --entitlements box.entitlements \
+            --sign "$SIGNING_IDENTITY" .build/release/box
+          codesign --verify --strict --verbose=2 .build/release/box
+
+      - name: Package
+        run: |
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE/completions" dist
+          install -m 0755 .build/release/box "$STAGE/box"
+          cp completions/box.bash completions/_box completions/box.fish "$STAGE/completions/"
+          tar -czf "dist/box-$GITHUB_REF_NAME-macos-arm64.tar.gz" -C "$STAGE" box completions
+          hdiutil create -volname "box $GITHUB_REF_NAME" -srcfolder "$STAGE" -ov -format UDZO "dist/box-$GITHUB_REF_NAME-macos-arm64.dmg"
+          codesign --force --timestamp --sign "$SIGNING_IDENTITY" "dist/box-$GITHUB_REF_NAME-macos-arm64.dmg"
+
+      - name: Notarize and staple
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          DMG="dist/box-$GITHUB_REF_NAME-macos-arm64.dmg"
+          KEY_PATH="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$APPLE_NOTARY_KEY" > "$KEY_PATH"
+          SUBMISSION="$(xcrun notarytool submit "$DMG" \
+            --key "$KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait --timeout 30m --output-format json)"
+          echo "$SUBMISSION"
+          STATUS="$(jq -r .status <<< "$SUBMISSION")"
+          if [ "$STATUS" != "Accepted" ]; then
+            SUBMISSION_ID="$(jq -r .id <<< "$SUBMISSION")"
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"
+            exit 1
+          fi
+          rm "$KEY_PATH"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && shasum -a 256 *.dmg *.tar.gz > checksums.txt)
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "box $GITHUB_REF_NAME" --generate-notes dist/*

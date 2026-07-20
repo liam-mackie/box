@@ -35,6 +35,27 @@ make install            # swift build -c release + codesign (virtualization enti
 > (required for vmnet). Keep the repo **out of** `~/Documents` and `~/Desktop`: a
 > macOS 26 vmnet bug fails network creation for binaries located there.
 
+## CI and releases
+
+CI (`.github/workflows/ci.yml`) runs on every push and PR: `swift test` on a
+`macos-26` runner, `cargo test` for box-proxy on Linux, and a check that
+`Sources/BoxKit/EmbeddedAssets.swift` was regenerated after any `assets/` or
+`proxy/` change.
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the
+release binary, signs it with a Developer ID certificate (hardened runtime +
+the virtualization entitlement), notarizes and staples a `.dmg`, and publishes
+a GitHub release with the dmg, a tarball of the same signed binary plus shell
+completions, and checksums. Stapling only attaches to the dmg — a bare Mach-O
+has no room for the ticket — but notarization registers the binary's cdhash
+with Apple, so the tarball copy also passes Gatekeeper's online check.
+
+The release workflow needs five repository secrets: `APPLE_CERTIFICATE_P12`
+(base64-encoded Developer ID Application certificate with its private key),
+`APPLE_CERTIFICATE_PASSWORD`, and an App Store Connect API key for `notarytool`
+as `APPLE_NOTARY_KEY` (the `.p8` contents), `APPLE_NOTARY_KEY_ID`, and
+`APPLE_NOTARY_ISSUER_ID`.
+
 ## Usage
 
 ```sh
