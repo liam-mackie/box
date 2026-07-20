@@ -189,7 +189,7 @@ enum Runner {
         // Every box is a client of its sidecar (shared or dedicated).
         let mounts: [Containerization.Mount] = clientMounts(
             cfg: cfg, cwd: cwd, agentHome: agentHome,
-            configDir: configDir, id: id)
+            configDir: configDir, id: id, secretPlan: secretPlan)
 
         let container = try await manager.create(
             id,
@@ -340,7 +340,16 @@ enum Runner {
                 log("box: ignoring invalid secret \"\(req.name)\": \(errs.joined(separator: "; "))")
             }
         }
-        let (resolved, unmet) = SecretInjection.partition(valid) { req in
+        var collisionFree: [SecretRequirement] = []
+        for req in valid {
+            let collisions = SecretInjection.tokenCollisionErrors(collisionFree + [req])
+            if collisions.isEmpty {
+                collisionFree.append(req)
+            } else {
+                log("box: ignoring secret \"\(req.name)\": \(collisions.joined(separator: "; "))")
+            }
+        }
+        let (resolved, unmet) = SecretInjection.partition(collisionFree) { req in
             guard let src = registry.bindings[req.name] else { return nil }
             return resolveSecretValue(src)
         }
@@ -400,7 +409,7 @@ enum Runner {
 
     static func clientMounts(
         cfg: Config, cwd: String, agentHome: String, configDir: String,
-        id: String
+        id: String, secretPlan: SecretPlan = SecretPlan()
     ) -> [Containerization.Mount] {
         var m: [Containerization.Mount] = []
         m.append(.share(source: cwd, destination: cwd))
@@ -409,7 +418,8 @@ enum Runner {
         m += userMounts(cfg)
         m += ManagedSettings.mounts(cfg, id: id)
         m += readOnlyRootMounts(cfg)
-        m += envMounts(cfg, id: id)
+        m += envMounts(
+            cfg, id: id, exports: SecretInjection.placeholderExports(secretPlan.resolved))
         m += agentCACertMounts(id: id)
         m += ClipboardSync.mounts(cfg, id: id)
         return m
@@ -555,7 +565,9 @@ enum Runner {
 
     static let secretMountDir = "/run/box-secrets"
 
-    static func envMounts(_ cfg: Config, id: String) -> [Containerization.Mount] {
+    static func envMounts(
+        _ cfg: Config, id: String, exports: [String: String] = [:]
+    ) -> [Containerization.Mount] {
         var dotenv: [String: String] = [:]
         if let path = cfg.envFile {
             if let text = try? String(contentsOfFile: expandTilde(path), encoding: .utf8) {
@@ -564,7 +576,13 @@ enum Runner {
                 log("box: envFile \(expandTilde(path)) is unreadable; skipping it")
             }
         }
-        let merged = EnvInjection.mergedEnv(configEnv: cfg.env, dotenv: dotenv)
+        var merged = EnvInjection.mergedEnv(configEnv: cfg.env, dotenv: dotenv)
+        for (key, token) in exports {
+            if merged[key] != nil {
+                log("box: env key \(key) is overridden by the placeholder secret export")
+            }
+            merged[key] = token
+        }
         guard !merged.isEmpty else { return [] }
 
         let dir = Box.secretDir(forBoxID: id)

@@ -16,19 +16,19 @@ import Foundation
 ///
 /// The pure model + validation here is filesystem-free (and unit tested directly);
 /// `SecretStore` is the thin JSON read/write wrapper. Value *resolution* and
-/// squid *rendering* live in `SecretInjection`.
+/// box-proxy config *rendering* live in `SecretInjection`.
 public enum SecretLocation: String, Codable, Sendable, Equatable, CaseIterable {
     /// Inject as a request header named `field`.
     case header
     /// Inject as a cookie named `field` (merged into the `Cookie:` header).
     case cookie
-    /// Inject as a URL query parameter named `field` (needs the url_rewrite helper).
+    /// Inject as a URL query parameter named `field`.
     case query
 }
 
 /// A host + optional path constraint on where a secret may be injected. `host`
-/// matches the request host exactly (squid `dstdomain`; a leading dot matches
-/// subdomains); at most one of `pathPrefix`/`pathRegex` narrows by path.
+/// matches the request host and its subdomains (a leading dot also matches the
+/// apex); at most one of `pathPrefix`/`pathRegex` narrows by path.
 public struct SecretScope: Codable, Sendable, Equatable {
     public var host: String
     public var pathPrefix: String?
@@ -43,18 +43,57 @@ public struct SecretScope: Codable, Sendable, Equatable {
 
 /// How a secret's value is placed onto a matching request. Fixed at
 /// definition time — Claude never chooses this at runtime.
-public struct SecretInjectionSpec: Codable, Sendable, Equatable {
-    public var location: SecretLocation
-    /// Header/cookie/query-param name the value is injected under.
-    public var field: String
-    /// Template applied host-side to shape the value, e.g. `Bearer ${value}` or
-    /// `${value|base64}`. Must contain `${value}`.
-    public var template: String
+public enum SecretInjectionSpec: Sendable, Equatable {
+    case insert(location: SecretLocation, field: String, template: String)
+    case placeholder(token: String, template: String)
 
-    public init(location: SecretLocation, field: String, template: String) {
-        self.location = location
-        self.field = field
-        self.template = template
+    public var template: String {
+        switch self {
+        case .insert(_, _, let template): return template
+        case .placeholder(_, let template): return template
+        }
+    }
+
+    public var modeLabel: String {
+        switch self {
+        case .insert(let location, _, _): return location.rawValue
+        case .placeholder: return "placeholder"
+        }
+    }
+}
+
+extension SecretInjectionSpec: Codable {
+    enum CodingKeys: String, CodingKey { case location, field, template, token }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let locationRaw = try c.decode(String.self, forKey: .location)
+        if locationRaw == "placeholder" {
+            self = .placeholder(
+                token: try c.decode(String.self, forKey: .token),
+                template: try c.decode(String.self, forKey: .template))
+        } else if let location = SecretLocation(rawValue: locationRaw) {
+            self = .insert(
+                location: location,
+                field: try c.decode(String.self, forKey: .field),
+                template: try c.decode(String.self, forKey: .template))
+        } else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .location, in: c,
+                debugDescription: "unknown injection location \"\(locationRaw)\"")
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .insert(let location, let field, let template):
+            try c.encode(location.rawValue, forKey: .location)
+            try c.encode(field, forKey: .field)
+            try c.encode(template, forKey: .template)
+        case .placeholder(let token, let template):
+            try c.encode("placeholder", forKey: .location)
+            try c.encode(token, forKey: .token)
+            try c.encode(template, forKey: .template)
+        }
     }
 }
 
@@ -174,8 +213,8 @@ public struct ProjectSecretsFile: Codable, Sendable, Equatable {
 // MARK: - Validation (pure)
 
 extension SecretRequirement {
-    /// The characters allowed in a secret name (used to form squid ACL names and
-    /// the Keychain service, so keep it conservative).
+    /// The characters allowed in a secret name (used to form the Keychain
+    /// service and the derived placeholder token, so keep it conservative).
     static let nameCharset = CharacterSet(charactersIn:
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 
@@ -195,11 +234,16 @@ extension SecretRequirement {
             errs.append("name \"\(name)\" has invalid characters (use A-Z a-z 0-9 _ -)")
         }
 
-        let field = injection.field.trimmingCharacters(in: .whitespaces)
-        if field.isEmpty {
-            errs.append("injection field name is empty")
-        } else if field.unicodeScalars.contains(where: { !Self.fieldCharset.contains($0) }) {
-            errs.append("injection field \"\(injection.field)\" has invalid characters")
+        switch injection {
+        case .insert(_, let rawField, _):
+            let field = rawField.trimmingCharacters(in: .whitespaces)
+            if field.isEmpty {
+                errs.append("injection field name is empty")
+            } else if field.unicodeScalars.contains(where: { !Self.fieldCharset.contains($0) }) {
+                errs.append("injection field \"\(rawField)\" has invalid characters")
+            }
+        case .placeholder(let token, _):
+            errs.append(contentsOf: SecretToken.validationErrors(token))
         }
 
         errs.append(contentsOf: SecretTemplate.validationErrors(injection.template))
@@ -231,8 +275,8 @@ extension SecretRequirement {
 // MARK: - Template (pure) — value shaping done host-side
 
 /// Renders/validates injection templates like `Bearer ${value}` or
-/// `${value|base64}`. All transforms run host-side so squid/the helper only ever
-/// inject a fully-rendered literal.
+/// `${value|base64}`. Validation runs host-side; box-proxy renders the same
+/// template grammar in the sidecar.
 public enum SecretTemplate {
     public static let knownTransforms: Set<String> = ["base64", "urlencode"]
 
@@ -282,6 +326,30 @@ public enum SecretTemplate {
         return hasValue ? [] : ["template must contain \"${value}\""]
     }
 
+}
+
+public enum SecretToken {
+    static let charset = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    static let lengthRange = 8...64
+
+    public static func derived(fromName name: String) -> String {
+        let mapped = name.uppercased().unicodeScalars.map { scalar in
+            charset.contains(scalar) ? Character(scalar) : "_"
+        }
+        return "BOX_SECRET_" + String(mapped)
+    }
+
+    public static func validationErrors(_ token: String) -> [String] {
+        var errs: [String] = []
+        if !lengthRange.contains(token.count) {
+            errs.append(
+                "token \"\(token)\" must be \(lengthRange.lowerBound)-\(lengthRange.upperBound) characters")
+        }
+        if token.unicodeScalars.contains(where: { !charset.contains($0) }) {
+            errs.append("token \"\(token)\" has invalid characters (use A-Z 0-9 _)")
+        }
+        return errs
+    }
 }
 
 // MARK: - Registry store (thin FS wrapper)

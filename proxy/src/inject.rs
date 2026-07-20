@@ -26,19 +26,24 @@ pub struct Secret {
     pub scopes: Vec<Scope>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Location {
-    Header,
-    Cookie,
-    Query,
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "location", rename_all = "lowercase")]
+pub enum Injection {
+    Header { field: String, template: String },
+    Cookie { field: String, template: String },
+    Query { field: String, template: String },
+    Placeholder { token: String, template: String },
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct Injection {
-    pub location: Location,
-    pub field: String,
-    pub template: String,
+impl Injection {
+    pub fn template(&self) -> &str {
+        match self {
+            Injection::Header { template, .. }
+            | Injection::Cookie { template, .. }
+            | Injection::Query { template, .. }
+            | Injection::Placeholder { template, .. } => template,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -136,10 +141,11 @@ pub fn scope_matches(scope: &Scope, normalized_host: &str, path: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rendered {
-    pub location: Location,
-    pub field: String,
-    pub value: String,
+pub enum Rendered {
+    Header { field: String, value: String },
+    Cookie { field: String, value: String },
+    Query { field: String, value: String },
+    Placeholder { token: String, value: String },
 }
 
 pub fn applicable(secrets: &[Secret], normalized_host: &str, path: &str) -> Vec<Rendered> {
@@ -152,15 +158,73 @@ pub fn applicable(secrets: &[Secret], normalized_host: &str, path: &str) -> Vec<
         if !matched {
             continue;
         }
-        if let Ok(value) = render_template(&secret.injection.template, &secret.value) {
-            out.push(Rendered {
-                location: secret.injection.location,
-                field: secret.injection.field.clone(),
+        let Ok(value) = render_template(secret.injection.template(), &secret.value) else {
+            continue;
+        };
+        out.push(match &secret.injection {
+            Injection::Header { field, .. } => Rendered::Header {
+                field: field.clone(),
                 value,
-            });
-        }
+            },
+            Injection::Cookie { field, .. } => Rendered::Cookie {
+                field: field.clone(),
+                value,
+            },
+            Injection::Query { field, .. } => Rendered::Query {
+                field: field.clone(),
+                value,
+            },
+            Injection::Placeholder { token, .. } => Rendered::Placeholder {
+                token: token.clone(),
+                value,
+            },
+        });
     }
     out
+}
+
+pub fn replace_token_str(text: &str, token: &str, value: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut out: Option<String> = None;
+    let mut rest = text;
+    while let Some(idx) = rest.find(token) {
+        let acc = out.get_or_insert_with(|| String::with_capacity(text.len()));
+        acc.push_str(&rest[..idx]);
+        acc.push_str(value);
+        rest = &rest[idx + token.len()..];
+    }
+    out.map(|mut acc| {
+        acc.push_str(rest);
+        acc
+    })
+}
+
+pub fn replace_token_bytes(body: &[u8], token: &str, value: &str) -> Option<Vec<u8>> {
+    let token = token.as_bytes();
+    if token.is_empty() || body.len() < token.len() {
+        return None;
+    }
+    let value = value.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut cursor = 0;
+    let mut copied = 0;
+    while cursor + token.len() <= body.len() {
+        if &body[cursor..cursor + token.len()] == token {
+            let acc = out.get_or_insert_with(|| Vec::with_capacity(body.len()));
+            acc.extend_from_slice(&body[copied..cursor]);
+            acc.extend_from_slice(value);
+            cursor += token.len();
+            copied = cursor;
+        } else {
+            cursor += 1;
+        }
+    }
+    out.map(|mut acc| {
+        acc.extend_from_slice(&body[copied..]);
+        acc
+    })
 }
 
 pub fn append_cookie(existing: Option<&str>, field: &str, value: &str) -> String {
@@ -192,16 +256,26 @@ pub fn set_query_param(existing: Option<&str>, key: &str, value: &str) -> String
 mod tests {
     use super::*;
 
-    fn secret(location: Location, field: &str, template: &str, value: &str, scopes: Vec<Scope>) -> Secret {
+    fn secret(injection: Injection, value: &str, scopes: Vec<Scope>) -> Secret {
         Secret {
             name: "TEST".to_string(),
             value: value.to_string(),
-            injection: Injection {
-                location,
-                field: field.to_string(),
-                template: template.to_string(),
-            },
+            injection,
             scopes,
+        }
+    }
+
+    fn header(field: &str, template: &str) -> Injection {
+        Injection::Header {
+            field: field.to_string(),
+            template: template.to_string(),
+        }
+    }
+
+    fn placeholder(token: &str, template: &str) -> Injection {
+        Injection::Placeholder {
+            token: token.to_string(),
+            template: template.to_string(),
         }
     }
 
@@ -229,11 +303,17 @@ mod tests {
         assert_eq!(file.secrets.len(), 1);
         let s = &file.secrets[0];
         assert_eq!(s.name, "GH_TOKEN");
-        assert_eq!(s.injection.location, Location::Header);
-        assert_eq!(s.injection.field, "Authorization");
+        assert_eq!(s.injection, header("Authorization", "Bearer ${value}"));
         assert_eq!(s.scopes[0].host, "api.github.com");
         assert_eq!(s.scopes[0].path_prefix.as_deref(), Some("/repos"));
         assert_eq!(s.scopes[0].path_regex, None);
+    }
+
+    #[test]
+    fn parses_placeholder_injection() {
+        let json = r#"{"location":"placeholder","token":"BOX_SECRET_X","template":"${value}"}"#;
+        let injection: Injection = serde_json::from_str(json).unwrap();
+        assert_eq!(injection, placeholder("BOX_SECRET_X", "${value}"));
     }
 
     #[test]
@@ -314,30 +394,110 @@ mod tests {
     #[test]
     fn applicable_matches_any_scope_and_renders() {
         let secrets = vec![secret(
-            Location::Header,
-            "Authorization",
-            "Bearer ${value}",
+            header("Authorization", "Bearer ${value}"),
             "tok",
             vec![scope("other.test", None, None), scope("api.github.com", Some("/repos"), None)],
         )];
         let got = applicable(&secrets, "api.github.com", "/repos/x");
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].location, Location::Header);
-        assert_eq!(got[0].field, "Authorization");
-        assert_eq!(got[0].value, "Bearer tok");
+        assert_eq!(
+            got,
+            vec![Rendered::Header {
+                field: "Authorization".to_string(),
+                value: "Bearer tok".to_string(),
+            }]
+        );
     }
 
     #[test]
     fn applicable_leaves_non_matching_requests_untouched() {
         let secrets = vec![secret(
-            Location::Header,
-            "Authorization",
-            "Bearer ${value}",
+            header("Authorization", "Bearer ${value}"),
             "tok",
             vec![scope("api.github.com", Some("/repos"), None)],
         )];
         assert!(applicable(&secrets, "api.github.com", "/users/x").is_empty());
         assert!(applicable(&secrets, "example.com", "/repos/x").is_empty());
+    }
+
+    #[test]
+    fn applicable_renders_placeholder_with_transforms() {
+        let secrets = vec![secret(
+            placeholder("BOX_SECRET_X", "${value|base64}"),
+            "abc",
+            vec![scope("api.github.com", None, None)],
+        )];
+        let got = applicable(&secrets, "api.github.com", "/anything");
+        assert_eq!(
+            got,
+            vec![Rendered::Placeholder {
+                token: "BOX_SECRET_X".to_string(),
+                value: "YWJj".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn applicable_skips_placeholder_on_scope_miss() {
+        let secrets = vec![secret(
+            placeholder("BOX_SECRET_X", "${value}"),
+            "abc",
+            vec![scope("api.github.com", Some("/repos"), None)],
+        )];
+        assert!(applicable(&secrets, "api.github.com", "/users/x").is_empty());
+        assert!(applicable(&secrets, "other.test", "/repos/x").is_empty());
+    }
+
+    #[test]
+    fn replace_token_str_replaces_every_occurrence() {
+        assert_eq!(
+            replace_token_str("a T b T c", "T", "X").as_deref(),
+            Some("a X b X c")
+        );
+        assert_eq!(
+            replace_token_str("TT", "T", "X").as_deref(),
+            Some("XX")
+        );
+    }
+
+    #[test]
+    fn replace_token_str_returns_none_without_occurrence() {
+        assert_eq!(replace_token_str("nothing here", "T", "X"), None);
+        assert_eq!(replace_token_str("anything", "", "X"), None);
+    }
+
+    #[test]
+    fn replace_token_str_does_not_re_expand_replacement() {
+        assert_eq!(
+            replace_token_str("T", "T", "aTb").as_deref(),
+            Some("aTb")
+        );
+    }
+
+    #[test]
+    fn replace_token_bytes_replaces_every_occurrence() {
+        assert_eq!(
+            replace_token_bytes(b"a T b T c", "T", "X").as_deref(),
+            Some(&b"a X b X c"[..])
+        );
+        assert_eq!(
+            replace_token_bytes(b"TT", "T", "X").as_deref(),
+            Some(&b"XX"[..])
+        );
+    }
+
+    #[test]
+    fn replace_token_bytes_returns_none_without_occurrence() {
+        assert_eq!(replace_token_bytes(b"nothing here", "T", "X"), None);
+        assert_eq!(replace_token_bytes(b"", "T", "X"), None);
+        assert_eq!(replace_token_bytes(b"anything", "", "X"), None);
+    }
+
+    #[test]
+    fn replace_token_bytes_does_not_re_expand_replacement() {
+        assert_eq!(
+            replace_token_bytes(b"T", "T", "aTb").as_deref(),
+            Some(&b"aTb"[..])
+        );
     }
 
     #[test]

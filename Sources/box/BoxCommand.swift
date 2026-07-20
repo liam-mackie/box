@@ -530,6 +530,10 @@ struct Secret: AsyncParsableCommand {
         discussion: """
             box injects a secret's value into matching requests at the egress proxy \
             (scoped by host and URL path), so Claude gets its use without its value. \
+            Insert mode (header/cookie/query) adds the value at a fixed spot; \
+            placeholder mode exports a stand-in token (BOX_SECRET_<NAME>) into the \
+            box and the proxy replaces it with the real value wherever it appears — \
+            headers, URL, or body — on the scoped hosts only. \
             The box-proxy sidecar decrypts allowlisted (non-pinned) hosts by default, \
             so no setup is needed; a box that defines secrets gets its own sidecar. \
             Projects can declare the secrets they need in .box/secrets.json; run \
@@ -543,7 +547,7 @@ struct Secret: AsyncParsableCommand {
 struct SecretSet: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "set",
-        abstract: "Define a secret and bind its value source (env var or Keychain).")
+        abstract: "Define a secret and bind its value source (prompts for anything missing).")
 
     @Argument(help: "Secret name (letters, digits, _ and -).")
     var name: String
@@ -554,15 +558,22 @@ struct SecretSet: AsyncParsableCommand {
         name: .customLong("from-keychain"),
         help: "Read from a Keychain generic password (service[/account]).")
     var fromKeychain: String?
+    @Flag(
+        name: .customLong("value-stdin"),
+        help: "Read the value from stdin and store it as a new Keychain item.")
+    var valueStdin = false
 
-    @Option(name: .customLong("as"), help: "Injection location: header | cookie | query.")
-    var location: String = "header"
+    @Option(
+        name: .customLong("as"), help: "Injection mode: header | cookie | query | placeholder.")
+    var location: String?
     @Option(
         name: .customLong("name"),
         help: "Field name (header/cookie/query-param). Default: Authorization.")
     var field: String?
     @Option(name: .long, help: "Value template, e.g. \"Bearer ${value}\" or \"${value|base64}\".")
     var template: String?
+    @Option(name: .long, help: "Placeholder token the agent sends (default: BOX_SECRET_<NAME>).")
+    var token: String?
 
     @Option(name: .long, help: "Host to inject on (repeatable).")
     var host: [String] = []
@@ -573,8 +584,8 @@ struct SecretSet: AsyncParsableCommand {
 
     func run() throws {
         try Commands.secretSet(
-            name: name, fromEnv: fromEnv, fromKeychain: fromKeychain,
-            location: location, field: field, template: template,
+            name: name, fromEnv: fromEnv, fromKeychain: fromKeychain, valueStdin: valueStdin,
+            location: location, field: field, template: template, token: token,
             hosts: host, pathPrefix: pathPrefix, pathRegex: pathRegex)
     }
 }

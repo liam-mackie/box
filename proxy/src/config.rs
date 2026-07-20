@@ -169,6 +169,21 @@ fn common_name(cert: &X509) -> Option<String> {
         .map(|e| String::from_utf8_lossy(e.data().as_slice()).into_owned())
 }
 
+fn validate_placeholder_token(token: &str) -> Result<(), String> {
+    if token.is_empty() {
+        return Err("placeholder token must not be empty".to_string());
+    }
+    let valid = token
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    if !valid {
+        return Err(format!(
+            "placeholder token \"{token}\" must contain only [A-Z0-9_]"
+        ));
+    }
+    Ok(())
+}
+
 pub fn check_config(paths: &Paths) -> Result<String, String> {
     let mut out = String::new();
 
@@ -193,8 +208,12 @@ pub fn check_config(paths: &Paths) -> Result<String, String> {
             let file: SecretsFile = serde_json::from_str(&text)
                 .map_err(|e| format!("secrets {}: {e}", paths.secrets.display()))?;
             for secret in &file.secrets {
-                inject::render_template(&secret.injection.template, &secret.value)
+                inject::render_template(secret.injection.template(), &secret.value)
                     .map_err(|e| format!("secret \"{}\": {e}", secret.name))?;
+                if let inject::Injection::Placeholder { token, .. } = &secret.injection {
+                    validate_placeholder_token(token)
+                        .map_err(|e| format!("secret \"{}\": {e}", secret.name))?;
+                }
                 for scope in &secret.scopes {
                     if let Some(pattern) = &scope.path_regex {
                         regex::Regex::new(pattern).map_err(|e| {

@@ -77,11 +77,46 @@ public enum SecretInjection {
         return json
     }
 
-    /// One-line human summary for the boot log (names + location + hosts).
+    /// One-line human summary for the boot log (names + mode + hosts).
     public static func bootSummary(_ resolved: [Resolved]) -> String {
         resolved.map { r in
             let hosts = r.requirement.scopes.map { $0.host }.joined(separator: ",")
-            return "\(r.requirement.name)(\(r.requirement.injection.location.rawValue)→\(hosts))"
+            return "\(r.requirement.name)(\(r.requirement.injection.modeLabel)→\(hosts))"
         }.joined(separator: " ")
+    }
+
+    public static func placeholderExports(_ resolved: [Resolved]) -> [String: String] {
+        var exports: [String: String] = [:]
+        for r in resolved {
+            if case .placeholder(let token, _) = r.requirement.injection {
+                exports[SecretToken.derived(fromName: r.requirement.name)] = token
+            }
+        }
+        return exports
+    }
+
+    public static func tokenCollisionErrors(_ reqs: [SecretRequirement]) -> [String] {
+        var tokens: [(name: String, token: String)] = []
+        for r in reqs {
+            if case .placeholder(let token, _) = r.injection {
+                tokens.append((r.name, token))
+            }
+        }
+        var errs: [String] = []
+        for i in tokens.indices {
+            for j in tokens.indices where j > i {
+                let (a, b) = (tokens[i], tokens[j])
+                if a.token == b.token {
+                    errs.append(
+                        "secrets \"\(a.name)\" and \"\(b.name)\" use the same token \(a.token)")
+                } else if a.token.contains(b.token) || b.token.contains(a.token) {
+                    errs.append(
+                        "token \(a.token) (secret \"\(a.name)\") and token \(b.token) "
+                            + "(secret \"\(b.name)\") overlap — one is a substring of the other, "
+                            + "so replacement would be order-dependent")
+                }
+            }
+        }
+        return errs
     }
 }

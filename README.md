@@ -66,7 +66,7 @@ boxes. Edit or delete it freely — box never overwrites an existing config.
 | `box trust [--show] [--allowlist-only]` / `box untrust` | Approve this project's `.box/` + devcontainer at their current content (or revoke) |
 | `box config` | Show the resolved config, where each value came from, and the project's trust status |
 | `box fs allow\|deny\|policy` | Show or hide subpaths of the broad read-only roots, live |
-| `box secret …` | Declare credentials Claude can use but never see — box-proxy injects them into matching requests (header/cookie/query, scoped by host + path) so the agent never holds the value |
+| `box secret …` | Declare credentials Claude can use but never see — box-proxy inserts them into matching requests (header/cookie/query) or swaps a placeholder token for the real value (headers, URL, body), scoped by host + path, so the agent never holds the value (see [Secret injection](#secret-injection)) |
 | `box net init` / `box net ip` | One-time (sudo): install `/etc/resolver/box` so `<box-id>.box` resolves on the Mac / print a box's guest IP |
 | `box system start\|stop\|status` | Manage the daemon that owns the shared egress sidecar (required for `box run`) |
 | `box doctor [--online]` | Diagnose the host setup and box readiness |
@@ -162,6 +162,33 @@ box system stop       # tear it down (refused while boxes are attached; --force 
 - **Every sidecar writes an egress access log** under `~/.box/logs/`:
   `shared-proxy/access.log` for the shared sidecar, `<box-id>/access.log` for
   dedicated ones. `box log --follow` tails it live; `box denied` aggregates it.
+
+### Secret injection
+
+`box secret set` defines a credential the agent can use but never see, in one
+of two modes (the interactive wizard walks you through everything a flag
+doesn't set):
+
+- **Insert** (`--as header|cookie|query`) — box-proxy adds the rendered value
+  at that fixed spot on every request matching the secret's host/path scopes.
+- **Placeholder** (`--as placeholder`) — the box exports `BOX_SECRET_<NAME>`
+  into the agent's environment holding a stand-in token, and the agent sends
+  that token wherever the API expects the credential. On requests matching the
+  secret's scopes, box-proxy replaces every occurrence of the token — in
+  headers, the URL, and the request body — with the real (template-rendered)
+  value. On any other host the token passes through un-replaced, so the scope
+  list is the exfiltration guard: the real value can only ever reach the hosts
+  you named.
+
+```sh
+box secret set github-token --as placeholder --host api.example.com --value-stdin
+```
+
+Placeholder limits: request bodies are scanned up to 10 MB (larger bodies pass
+through untouched), and compressed (`Content-Encoding`) request bodies aren't
+decoded, so tokens inside them aren't replaced. A secret whose value doesn't
+resolve at launch exports nothing — a literal token would otherwise reach the
+upstream un-replaced — and `box run` warns to run `box secret setup`.
 
 > [!NOTE]
 > box-proxy is compiled from an embedded Rust crate (`proxy/`) as part of `box
@@ -264,8 +291,10 @@ Sources/BoxKit/        library (logic; importable by tests)
   FsPolicy.swift       dynamic read-only-root visibility rules (`box fs`)
   EgressLog.swift      pure egress access-log parser for `box log`/`denied`
   Diagnostics.swift    `box doctor` checks (pure probes over injectable seams)
-  SecretStore.swift    secret requirements + value bindings (global/project registry)
-  SecretInjection.swift secret validation/scoping + box-proxy secrets.json rendering
+  SecretStore.swift    secret model: insert/placeholder injection specs, tokens,
+                       validation + value bindings (global/project registry)
+  SecretInjection.swift pure secret cores: scoping, placeholder env exports,
+                       token-collision checks, box-proxy secrets.json rendering
   ClipboardSync.swift  host clipboard image → per-run mount (paste-in-box)
   BoxExec.swift        exec-into-running-box control socket (server + client)
   Config.swift         layered config (global ⊕ project) + starter-config seeding

@@ -4,8 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
-use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST};
+use futures::{stream, StreamExt};
+use http::header::{
+    HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, TRANSFER_ENCODING,
+};
 use http::uri::PathAndQuery;
+use http_body_util::BodyExt;
+use hudsucker::hyper::body::{Body as HttpBody, Bytes};
 use hudsucker::hyper::{Method, Request, Response, StatusCode, Uri};
 use hudsucker::hyper_util::client::legacy::Error as LegacyError;
 use hudsucker::rustls::crypto::aws_lc_rs;
@@ -13,7 +18,7 @@ use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 
 use crate::config::{build_authority, fingerprint, load_snapshot, parse_ca, Paths, Snapshot};
 use crate::decision::{request_action, should_intercept_connect, RequestAction};
-use crate::inject::{self, Location, Secret};
+use crate::inject::{self, Rendered};
 use crate::allowlist::normalize_host;
 use crate::logfmt::{access_line, NO_FLAGS, NO_SNI};
 use crate::pinned::is_pinned;
@@ -125,30 +130,152 @@ fn deny_response(host: &str) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::from("forbidden")))
 }
 
-fn apply_injections(req: &mut Request<Body>, secrets: &[Secret], host: &str) {
-    let path = req.uri().path().to_string();
-    for rendered in inject::applicable(secrets, host, &path) {
-        match rendered.location {
-            Location::Header => {
-                if let (Ok(name), Ok(value)) = (
-                    HeaderName::from_bytes(rendered.field.as_bytes()),
-                    HeaderValue::from_str(&rendered.value),
+const MAX_BUFFERED_BODY: usize = 10 * 1024 * 1024;
+
+struct Placeholder {
+    token: String,
+    value: String,
+}
+
+fn partition_rendered(rendered: Vec<Rendered>) -> (Vec<Placeholder>, Vec<Rendered>) {
+    let mut placeholders = Vec::new();
+    let mut inserts = Vec::new();
+    for item in rendered {
+        match item {
+            Rendered::Placeholder { token, value } => placeholders.push(Placeholder { token, value }),
+            other => inserts.push(other),
+        }
+    }
+    (placeholders, inserts)
+}
+
+fn replace_all_str(source: &str, placeholders: &[Placeholder]) -> Option<String> {
+    let mut current: Option<String> = None;
+    for placeholder in placeholders {
+        let text = current.as_deref().unwrap_or(source);
+        if let Some(replaced) = inject::replace_token_str(text, &placeholder.token, &placeholder.value) {
+            current = Some(replaced);
+        }
+    }
+    current
+}
+
+fn replace_all_bytes(source: Vec<u8>, placeholders: &[Placeholder]) -> Vec<u8> {
+    let mut current = source;
+    for placeholder in placeholders {
+        if let Some(replaced) = inject::replace_token_bytes(&current, &placeholder.token, &placeholder.value) {
+            current = replaced;
+        }
+    }
+    current
+}
+
+fn apply_placeholder_headers(req: &mut Request<Body>, placeholders: &[Placeholder]) {
+    for (name, value) in req.headers_mut().iter_mut() {
+        if *name == HOST {
+            continue;
+        }
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        if let Some(replaced) = replace_all_str(text, placeholders) {
+            if let Ok(header) = HeaderValue::from_str(&replaced) {
+                *value = header;
+            }
+        }
+    }
+}
+
+fn apply_placeholder_uri(req: &mut Request<Body>, placeholders: &[Placeholder]) {
+    let Some(path_and_query) = req.uri().path_and_query().map(|p| p.as_str().to_string()) else {
+        return;
+    };
+    let Some(replaced) = replace_all_str(&path_and_query, placeholders) else {
+        return;
+    };
+    let Ok(parsed) = replaced.parse::<PathAndQuery>() else {
+        return;
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.path_and_query = Some(parsed);
+    if let Ok(uri) = Uri::from_parts(parts) {
+        *req.uri_mut() = uri;
+    }
+}
+
+async fn apply_placeholder_body(
+    req: Request<Body>,
+    placeholders: &[Placeholder],
+) -> Result<Request<Body>, Response<Body>> {
+    let (parts, body) = req.into_parts();
+    if body.is_end_stream() || body.size_hint().lower() > MAX_BUFFERED_BODY as u64 {
+        return Ok(Request::from_parts(parts, body));
+    }
+
+    let mut body = body;
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                if buffered.len() + data.len() > MAX_BUFFERED_BODY {
+                    let head = Bytes::from(std::mem::take(&mut buffered));
+                    let prefix = stream::iter(vec![
+                        Ok::<Bytes, hudsucker::Error>(head),
+                        Ok(data),
+                    ]);
+                    let reconstructed = prefix.chain(body.into_data_stream());
+                    return Ok(Request::from_parts(parts, Body::from_stream(reconstructed)));
+                }
+                buffered.extend_from_slice(&data);
+            }
+            Some(Err(_)) => return Err(bad_gateway()),
+            None => break,
+        }
+    }
+
+    let replaced = replace_all_bytes(buffered, placeholders);
+    let mut parts = parts;
+    parts.headers.remove(TRANSFER_ENCODING);
+    if let Ok(length) = HeaderValue::from_str(&replaced.len().to_string()) {
+        parts.headers.insert(CONTENT_LENGTH, length);
+    }
+    Ok(Request::from_parts(parts, Body::from(replaced)))
+}
+
+fn bad_gateway() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn apply_inserts(req: &mut Request<Body>, inserts: &[Rendered]) {
+    for rendered in inserts {
+        match rendered {
+            Rendered::Header { field, value } => {
+                if let (Ok(name), Ok(header)) = (
+                    HeaderName::from_bytes(field.as_bytes()),
+                    HeaderValue::from_str(value),
                 ) {
-                    req.headers_mut().insert(name, value);
+                    req.headers_mut().insert(name, header);
                 }
             }
-            Location::Cookie => {
+            Rendered::Cookie { field, value } => {
                 let existing = req
                     .headers()
                     .get(COOKIE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                let merged = inject::append_cookie(existing.as_deref(), &rendered.field, &rendered.value);
-                if let Ok(value) = HeaderValue::from_str(&merged) {
-                    req.headers_mut().insert(COOKIE, value);
+                let merged = inject::append_cookie(existing.as_deref(), field, value);
+                if let Ok(header) = HeaderValue::from_str(&merged) {
+                    req.headers_mut().insert(COOKIE, header);
                 }
             }
-            Location::Query => apply_query(req, &rendered.field, &rendered.value),
+            Rendered::Query { field, value } => apply_query(req, field, value),
+            Rendered::Placeholder { .. } => {}
         }
     }
 }
@@ -219,9 +346,32 @@ impl HttpHandler for BoxHandler {
 
         let url = full_url(&req, &host);
         let method = req.method().to_string();
-        let mut req = req;
-        apply_injections(&mut req, &snapshot.secrets, &host);
+        let rendered = inject::applicable(&snapshot.secrets, &host, req.uri().path());
         drop(snapshot);
+
+        let (placeholders, inserts) = partition_rendered(rendered);
+        let mut req = req;
+        if !placeholders.is_empty() {
+            apply_placeholder_headers(&mut req, &placeholders);
+            apply_placeholder_uri(&mut req, &placeholders);
+            match apply_placeholder_body(req, &placeholders).await {
+                Ok(updated) => req = updated,
+                Err(response) => {
+                    self.state.logger.log(&access_line(
+                        SystemTime::now(),
+                        &client_ip,
+                        NO_FLAGS,
+                        502,
+                        0,
+                        &method,
+                        &url,
+                        NO_SNI,
+                    ));
+                    return response.into();
+                }
+            }
+        }
+        apply_inserts(&mut req, &inserts);
         self.pending = Some(Pending {
             time: SystemTime::now(),
             client_ip,

@@ -1023,64 +1023,311 @@ public enum Commands {
 
     // MARK: - Proxy-injected secrets (`box secret`)
     //
-    // A secret lets Claude *use* a credential without *seeing* it: squid (uid
-    // proxy) injects the value into matching requests; the agent only ever sees a
-    // redacted manifest. See SecretStore / SecretInjection / Runner.secretMounts.
-    // Requires the OpenSSL squid + `box ca init` (path-level injection needs bump).
+    // A secret lets Claude *use* a credential without *seeing* it: the box-proxy
+    // sidecar injects the value into matching requests (insert mode) or replaces
+    // a well-known placeholder token with it (placeholder mode), scoped by host +
+    // path. See SecretStore / SecretInjection / Runner.injectMounts.
 
-    /// Define a GLOBAL secret (requirement + its value binding) in one shot.
+    private enum InjectionMode: String, CaseIterable {
+        case header, cookie, query, placeholder
+    }
+
+    private enum SecretValueOrigin {
+        case bound(SecretSource)
+        case storeInKeychain(String)
+        case readStdinAtSave
+    }
+
+    /// Define a GLOBAL secret (requirement + its value binding) in one shot;
+    /// prompts for anything missing when stdin is a TTY.
     public static func secretSet(
-        name: String, fromEnv: String?, fromKeychain: String?,
-        location locationRaw: String, field: String?, template: String?,
+        name: String, fromEnv: String?, fromKeychain: String?, valueStdin: Bool,
+        location: String?, field: String?, template: String?, token: String?,
         hosts: [String], pathPrefix: String?, pathRegex: String?
     ) throws {
-        let source = try parseSource(fromEnv: fromEnv, fromKeychain: fromKeychain)
-        guard let location = SecretLocation(rawValue: locationRaw.lowercased()) else {
-            throw CBError(
-                "--as must be one of: "
-                    + SecretLocation.allCases.map { $0.rawValue }.joined(separator: ", "))
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        if trimmedName.isEmpty
+            || trimmedName.unicodeScalars.contains(where: {
+                !SecretRequirement.nameCharset.contains($0)
+            })
+        {
+            throw CBError("secret name \"\(name)\" is invalid (use A-Z a-z 0-9 _ -)")
         }
-        let resolvedField: String
-        if let f = field, !f.trimmingCharacters(in: .whitespaces).isEmpty {
-            resolvedField = f
-        } else if location == .header {
-            resolvedField = "Authorization"
-        } else {
-            throw CBError("--name (the \(location.rawValue) field name) is required for --as \(location.rawValue)")
-        }
-        let resolvedTemplate = template ?? (location == .header ? "Bearer ${value}" : "${value}")
 
-        let cleanedHosts = hosts.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        var mode: InjectionMode?
+        if let location {
+            guard let parsed = InjectionMode(rawValue: location.lowercased()) else {
+                throw CBError(
+                    "--as must be one of: "
+                        + InjectionMode.allCases.map { $0.rawValue }.joined(separator: ", "))
+            }
+            mode = parsed
+        }
+        if token != nil && mode != .placeholder {
+            throw CBError("--token requires --as placeholder")
+        }
+        if field != nil && mode == .placeholder {
+            throw CBError("--name does not apply to --as placeholder (use --token)")
+        }
+        let sourceFlagCount = [fromEnv != nil, fromKeychain != nil, valueStdin].filter { $0 }.count
+        guard sourceFlagCount <= 1 else {
+            throw CBError("provide exactly one of --from-env, --from-keychain, or --value-stdin")
+        }
+
+        let interactive = isatty(STDIN_FILENO) == 1
+        let origin: SecretValueOrigin
+        if fromEnv != nil || fromKeychain != nil {
+            origin = .bound(try parseSource(fromEnv: fromEnv, fromKeychain: fromKeychain))
+        } else if valueStdin {
+            origin = .readStdinAtSave
+        } else if interactive {
+            origin = try promptSecretSource(name: name)
+        } else {
+            throw CBError(
+                "stdin is not a TTY; provide --from-env VAR, "
+                    + "--from-keychain service[/account], or --value-stdin")
+        }
+
+        var cleanedHosts = hosts.map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var resolvedPathPrefix = pathPrefix
+        if cleanedHosts.isEmpty && interactive {
+            cleanedHosts = try promptHosts()
+            if pathPrefix == nil && pathRegex == nil {
+                resolvedPathPrefix = try promptPathPrefix()
+            }
+        }
         guard !cleanedHosts.isEmpty else { throw CBError("at least one --host is required") }
         let scopes = cleanedHosts.map {
-            SecretScope(host: $0, pathPrefix: pathPrefix, pathRegex: pathRegex)
+            SecretScope(host: $0, pathPrefix: resolvedPathPrefix, pathRegex: pathRegex)
         }
 
-        let req = SecretRequirement(
-            name: name,
-            injection: SecretInjectionSpec(
-                location: location, field: resolvedField, template: resolvedTemplate),
-            scopes: scopes)
-        let errs = req.validationErrors(isPinned: Runner.isAlwaysSpliced)
+        if mode == nil && interactive { mode = try promptMode() }
+        let spec = try resolveSpec(
+            mode: mode ?? .header, name: name, field: field, template: template, token: token,
+            interactive: interactive)
+
+        let req = SecretRequirement(name: name, injection: spec, scopes: scopes)
+        var errs = req.validationErrors(isPinned: Runner.isAlwaysSpliced)
+        let (existing, _, _, _) = effectiveSecrets()
+        errs += SecretInjection.tokenCollisionErrors(existing.filter { $0.name != name } + [req])
         guard errs.isEmpty else {
             throw CBError("invalid secret:\n  - " + errs.joined(separator: "\n  - "))
         }
 
+        let source = try bindSource(origin, name: name)
         var registry = SecretStore.load()
         registry.upsert(req)
         registry.bindings[name] = source
         try SecretStore.save(registry)
 
-        print("defined secret \"\(name)\":")
-        print("  inject:  \(location.rawValue) \(resolvedField) = \(resolvedTemplate)")
-        print("  scopes:  " + scopes.map { scopeLabel($0) }.joined(separator: ", "))
+        printSecretSetSummary(req, source: source)
+    }
+
+    private static func resolveSpec(
+        mode: InjectionMode, name: String, field: String?, template: String?, token: String?,
+        interactive: Bool
+    ) throws -> SecretInjectionSpec {
+        let fieldCharsetErrors: (String) -> [String] = { f in
+            f.unicodeScalars.contains(where: { !SecretRequirement.fieldCharset.contains($0) })
+                ? ["field \"\(f)\" has invalid characters"] : []
+        }
+        switch mode {
+        case .header:
+            var resolvedField = field
+            var resolvedTemplate = template
+            if interactive && resolvedField == nil {
+                resolvedField = try promptRequired(
+                    "header name [Authorization]: ", default: "Authorization",
+                    validate: fieldCharsetErrors)
+            }
+            if interactive && resolvedTemplate == nil {
+                resolvedTemplate = try promptRequired(
+                    "template [Bearer ${value}]: ", default: "Bearer ${value}",
+                    validate: SecretTemplate.validationErrors)
+            }
+            return .insert(
+                location: .header, field: resolvedField ?? "Authorization",
+                template: resolvedTemplate ?? "Bearer ${value}")
+        case .cookie, .query:
+            var resolvedField = field
+            var resolvedTemplate = template
+            if interactive && resolvedField == nil {
+                resolvedField = try promptRequired(
+                    "\(mode.rawValue) field name: ", validate: fieldCharsetErrors)
+            }
+            if interactive && resolvedTemplate == nil {
+                resolvedTemplate = try promptRequired(
+                    "template [${value}]: ", default: "${value}",
+                    validate: SecretTemplate.validationErrors)
+            }
+            guard let f = resolvedField, !f.trimmingCharacters(in: .whitespaces).isEmpty else {
+                throw CBError(
+                    "--name (the \(mode.rawValue) field name) is required for --as \(mode.rawValue)")
+            }
+            return .insert(
+                location: SecretLocation(rawValue: mode.rawValue)!, field: f,
+                template: resolvedTemplate ?? "${value}")
+        case .placeholder:
+            var resolvedToken = token
+            var resolvedTemplate = template
+            let derived = SecretToken.derived(fromName: name)
+            if interactive && resolvedToken == nil {
+                resolvedToken = try promptRequired(
+                    "placeholder token [\(derived)]: ", default: derived,
+                    validate: SecretToken.validationErrors)
+            }
+            if interactive && resolvedTemplate == nil {
+                resolvedTemplate = try promptRequired(
+                    "template [${value}]: ", default: "${value}",
+                    validate: SecretTemplate.validationErrors)
+            }
+            return .placeholder(
+                token: resolvedToken ?? derived, template: resolvedTemplate ?? "${value}")
+        }
+    }
+
+    private static func bindSource(_ origin: SecretValueOrigin, name: String) throws -> SecretSource
+    {
+        switch origin {
+        case .bound(let source):
+            return source
+        case .storeInKeychain(let value):
+            return try storeKeychainValue(value, name: name)
+        case .readStdinAtSave:
+            let data = FileHandle.standardInput.readDataToEndOfFile()
+            guard var value = String(data: data, encoding: .utf8) else {
+                throw CBError("the value on stdin is not valid UTF-8")
+            }
+            while value.hasSuffix("\n") || value.hasSuffix("\r") { value.removeLast() }
+            guard !value.isEmpty else { throw CBError("the value on stdin is empty") }
+            return try storeKeychainValue(value, name: name)
+        }
+    }
+
+    private static func storeKeychainValue(_ value: String, name: String) throws -> SecretSource {
+        let service = "box-secret-\(name)"
+        let account = NSUserName()
+        try Sh.checked([
+            "security", "add-generic-password", "-U",
+            "-s", service, "-a", account, "-w", value,
+        ])
+        return .keychain(service: service, account: account)
+    }
+
+    private static func printSecretSetSummary(_ req: SecretRequirement, source: SecretSource) {
+        print("defined secret \"\(req.name)\":")
+        switch req.injection {
+        case .insert(let location, let field, let template):
+            print("  inject:  \(location.rawValue) \(field) = \(template)")
+        case .placeholder(let token, let template):
+            print("  inject:  placeholder \(token) = \(template)")
+            print("  guest env:  \(SecretToken.derived(fromName: req.name)) = \(token)")
+        }
+        print("  scopes:  " + req.scopes.map { scopeLabel($0) }.joined(separator: ", "))
         print("  source:  \(source.label)")
         print("The host(s) must be allowlisted (`box allow`) or the request is denied first;")
-        print("the box-proxy sidecar decrypts them and injects the value (never seen by Claude).")
-        if location == .query {
+        switch req.injection {
+        case .placeholder(let token, _):
             print(
-                "WARNING: --as query puts the value in the URL, which can appear in proxy/upstream "
-                    + "logs. Prefer --as header/cookie unless the API only accepts a query credential.")
+                "the box exports $\(SecretToken.derived(fromName: req.name)) holding the token "
+                    + "\(token); box-proxy replaces every occurrence of it (headers, URL, body)")
+            print(
+                "with the real value on the scoped host(s) only — anywhere else the token "
+                    + "passes through unchanged.")
+        case .insert(let location, _, _):
+            print("the box-proxy sidecar decrypts them and injects the value (never seen by Claude).")
+            if location == .query {
+                print(
+                    "WARNING: --as query puts the value in the URL, which can appear in proxy/upstream "
+                        + "logs. Prefer --as header/cookie unless the API only accepts a query credential.")
+            }
+        }
+    }
+
+    private static func promptLine(_ label: String) throws -> String {
+        print(label, terminator: "")
+        guard let line = readLine(strippingNewline: true) else {
+            throw CBError("input ended before the secret was fully defined")
+        }
+        return line.trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func promptRequired(
+        _ label: String, default def: String? = nil,
+        validate: (String) -> [String] = { _ in [] }
+    ) throws -> String {
+        while true {
+            let entered = try promptLine(label)
+            let value = entered.isEmpty ? (def ?? "") : entered
+            if value.isEmpty { continue }
+            let errs = validate(value)
+            if errs.isEmpty { return value }
+            errs.forEach { print("  \($0)") }
+        }
+    }
+
+    private static func promptSecretSource(name: String) throws -> SecretValueOrigin {
+        while true {
+            let choice = try promptLine(
+                "value: [p]aste (stored in Keychain) / [e]nv var / existing [k]eychain item? [p] ")
+            switch choice.lowercased().first {
+            case nil, "p"?:
+                let value = String(cString: getpass("paste value (hidden): "))
+                if value.isEmpty {
+                    print("  value is empty")
+                    continue
+                }
+                return .storeInKeychain(value)
+            case "e"?:
+                let varName = try promptRequired("env var name [\(name)]: ", default: name)
+                return .bound(.env(varName))
+            case "k"?:
+                let entered = try promptRequired("keychain item (service[/account]): ")
+                return .bound(try parseSource(fromEnv: nil, fromKeychain: entered))
+            default:
+                print("  choose p, e, or k")
+            }
+        }
+    }
+
+    private static func promptHosts() throws -> [String] {
+        while true {
+            let entered = try promptLine("host(s) to inject on (comma-separated): ")
+            let hosts = entered.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            guard !hosts.isEmpty else { continue }
+            if let pinned = hosts.first(where: Runner.isAlwaysSpliced) {
+                print(
+                    "  host \"\(pinned)\" is pinned (Anthropic/npm/git) and can never be "
+                        + "injected/bumped")
+                continue
+            }
+            return hosts
+        }
+    }
+
+    private static func promptPathPrefix() throws -> String? {
+        while true {
+            let entered = try promptLine("path prefix (optional, starts with \"/\") []: ")
+            if entered.isEmpty { return nil }
+            if entered.hasPrefix("/") { return entered }
+            print("  path prefix must start with \"/\"")
+        }
+    }
+
+    private static func promptMode() throws -> InjectionMode {
+        while true {
+            let choice = try promptLine(
+                "inject as: [h]eader / [c]ookie / [q]uery / [p]laceholder? [h] ")
+            switch choice.lowercased().first {
+            case nil, "h"?: return .header
+            case "c"?: return .cookie
+            case "q"?: return .query
+            case "p"?: return .placeholder
+            default: print("  choose h, c, q, or p")
+            }
         }
     }
 
@@ -1123,7 +1370,7 @@ public enum Commands {
                 continue
             }
             print("• \(req.name)")
-            print("    inject: \(req.injection.location.rawValue) \(injField(req))")
+            print("    inject: \(req.injection.modeLabel) \(injField(req))")
             print("    scopes: " + req.scopes.map { scopeLabel($0) }.joined(separator: ", "))
             print("    provide via [e]nv var, [p]aste, or [s]kip? ", terminator: "")
             guard let choice = readLine(strippingNewline: true)?.lowercased() else { break }
@@ -1137,14 +1384,11 @@ public enum Commands {
             case "p":
                 let value = String(cString: getpass("    paste value (hidden): "))
                 guard !value.isEmpty else { print("    empty; skipped"); continue }
-                let service = "box-secret-\(req.name)"
-                let account = NSUserName()
-                try Sh.checked([
-                    "security", "add-generic-password", "-U",
-                    "-s", service, "-a", account, "-w", value,
-                ])
-                registry.bindings[req.name] = .keychain(service: service, account: account)
-                print("    stored in Keychain as \(service) (registry references it; no plaintext)")
+                let source = try storeKeychainValue(value, name: req.name)
+                registry.bindings[req.name] = source
+                print(
+                    "    stored in Keychain as box-secret-\(req.name) "
+                        + "(registry references it; no plaintext)")
             default:
                 print("    skipped")
             }
@@ -1241,13 +1485,21 @@ public enum Commands {
             status = "UNMET — run `box secret setup`"
         }
         print("\(req.name)  [\(origin)]")
-        print("  inject: \(req.injection.location.rawValue) \(injField(req)) = \(req.injection.template)")
+        print("  inject: \(req.injection.modeLabel) \(injField(req)) = \(req.injection.template)")
+        if case .placeholder = req.injection {
+            print("  guest env: \(SecretToken.derived(fromName: req.name))")
+        }
         print("  scopes: " + req.scopes.map { scopeLabel($0) }.joined(separator: ", "))
         print("  source: \(status)")
     }
 
     private static func injField(_ r: SecretRequirement) -> String {
-        r.injection.location == .cookie ? "Cookie" : r.injection.field
+        switch r.injection {
+        case .insert(let location, let field, _):
+            return location == .cookie ? "Cookie" : field
+        case .placeholder(let token, _):
+            return token
+        }
     }
 
     private static func scopeLabel(_ s: SecretScope) -> String {

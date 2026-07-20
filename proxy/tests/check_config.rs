@@ -59,7 +59,7 @@ fn check_config_succeeds_over_fixtures() {
     let paths = paths_over_fixtures(&dir, dir.join("secrets.json"));
     let summary = check_config(&paths).expect("check_config should succeed over the fixtures");
     assert!(summary.contains("allowlist:"), "summary: {summary}");
-    assert!(summary.contains("secrets: 3 valid"), "summary: {summary}");
+    assert!(summary.contains("secrets: 4 valid"), "summary: {summary}");
     assert!(summary.contains("CA: loaded"), "summary: {summary}");
 }
 
@@ -80,4 +80,28 @@ fn check_config_fails_on_invalid_secrets_json() {
     let result = check_config(&paths);
     std::fs::remove_file(&bad).ok();
     assert!(result.is_err(), "invalid secrets.json should fail check-config");
+}
+
+#[test]
+fn check_config_fails_on_invalid_placeholder_token() {
+    let dir = fixtures_dir();
+    let bad = std::env::temp_dir().join("box-proxy-bad-placeholder-token.json");
+    std::fs::write(
+        &bad,
+        r#"{
+            "secrets": [
+                {
+                    "name": "BAD_TOKEN",
+                    "value": "v",
+                    "injection": { "location": "placeholder", "token": "box_secret_lower", "template": "${value}" },
+                    "scopes": [ { "host": "api.github.com" } ]
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+    let paths = paths_over_fixtures(&dir, bad.clone());
+    let result = check_config(&paths);
+    std::fs::remove_file(&bad).ok();
+    assert!(result.is_err(), "a placeholder token outside [A-Z0-9_] should fail check-config");
 }

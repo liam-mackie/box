@@ -164,6 +164,34 @@ struct EnvMountsTests {
         }
     }
 
+    @Test("placeholder exports alone still stage the env file")
+    func exportsOnlyStillMounts() throws {
+        try withTempBoxDir { _ in
+            let id = "box-exports-1"
+            let mounts = Runner.envMounts(
+                Config(env: [:], envFile: nil), id: id,
+                exports: ["BOX_SECRET_GH": "BOX_SECRET_GH"])
+            #expect(mounts.count == 1)
+            let contents = try String(contentsOf: Box.envFile(forBoxID: id), encoding: .utf8)
+            #expect(contents.contains("BOX_SECRET_GH='BOX_SECRET_GH'"))
+            try? FileManager.default.removeItem(at: Box.secretDir(forBoxID: id))
+        }
+    }
+
+    @Test("placeholder exports win over user env on key collision")
+    func exportsOverrideUserEnv() throws {
+        try withTempBoxDir { _ in
+            let id = "box-exports-2"
+            _ = Runner.envMounts(
+                Config(env: ["BOX_SECRET_GH": "user"], envFile: nil), id: id,
+                exports: ["BOX_SECRET_GH": "token"])
+            let contents = try String(contentsOf: Box.envFile(forBoxID: id), encoding: .utf8)
+            #expect(contents.contains("BOX_SECRET_GH='token'"))
+            #expect(!contents.contains("'user'"))
+            try? FileManager.default.removeItem(at: Box.secretDir(forBoxID: id))
+        }
+    }
+
     @Test("config env overrides envFile via the filesystem path")
     func fileAndConfigMerge() throws {
         try withTempBoxDir { _ in

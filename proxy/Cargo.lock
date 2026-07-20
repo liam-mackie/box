@@ -87,7 +87,9 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "base64",
+ "futures",
  "http",
+ "http-body-util",
  "hudsucker",
  "percent-encoding",
  "regex",
